@@ -146,8 +146,8 @@ const CARD_DECKS = {
     {
       deck: "Kesempatan",
       title: "Menuju Parkir Bebas",
-      text: "Pindah ke Parkir Bebas.",
-      effect: { type: "moveTo", tile: 20, money: 0 }
+      text: "Pindah ke Parkir Bebas, lalu pilih hadiah Uang Pajak atau 1 petak tujuan yang menguntungkan.",
+      effect: { type: "moveToFreeParking" }
     },
     {
       deck: "Kesempatan",
@@ -171,6 +171,12 @@ let lastRouletteId = "";
 let localHiddenCardId = "";
 let localPopupOpen = false;
 let freeMoveAnimating = false;
+
+// Animasi saldo pemain disimpan secara lokal agar update Firebase tidak
+// langsung mengganti angka sebelum indikator pemasukan/pengeluaran selesai.
+const playerMoneyAnimationStates = new Map();
+let moneyAnimationGeneration = 0;
+let moneyAudioContext = null;
 
 const els = {
   setupPanel: document.getElementById("setupPanel"),
@@ -198,6 +204,7 @@ const els = {
   cardPlayerName: document.getElementById("cardPlayerName"),
   cardTitle: document.getElementById("cardTitle"),
   cardText: document.getElementById("cardText"),
+  cardActions: document.getElementById("cardActions"),
   cardCloseBtn: document.getElementById("cardCloseBtn"),
   cardContinueBtn: document.getElementById("cardContinueBtn")
 };
@@ -355,6 +362,7 @@ async function joinRoom() {
 }
 
 function enterGameView() {
+  resetPlayerMoneyAnimations();
   els.setupPanel.classList.add("hidden");
   els.gamePanel.classList.remove("hidden");
   els.roomBadge.textContent = `Room: ${roomCode}`;
@@ -473,6 +481,20 @@ async function startGame() {
   await addRemoteLog("Game dimulai.");
 }
 
+function normalizeRouletteAngle(angle) {
+  return ((Number(angle || 0) % 360) + 360) % 360;
+}
+
+function getRouletteFinalRotation(previousRotation, result, fullTurns = 5) {
+  const segment = 360 / 12;
+  const currentRotation = Number(previousRotation || 0);
+  const currentAngle = normalizeRouletteAngle(currentRotation);
+  const targetAngle = normalizeRouletteAngle(-((Number(result) - 1) * segment));
+  const alignmentDelta = (targetAngle - currentAngle + 360) % 360;
+
+  return currentRotation + (360 * fullTurns) + alignmentDelta;
+}
+
 async function rollDice() {
   if (!canIRoll()) return;
 
@@ -485,9 +507,7 @@ async function rollDice() {
   const moveId = `${Date.now()}_${mySeat}_${Math.random().toString(16).slice(2)}`;
 
   const prevRotation = Number(roomState.lastRoulette?.rotation || 0);
-  const segment = 360 / 12;
-  const targetAngle = -((result - 1) * segment);
-  const rotation = prevRotation + 360 * 5 + targetAngle;
+  const rotation = getRouletteFinalRotation(prevRotation, result);
 
   let playerMoney = Number(player.money || 0) + (passedStart ? PASS_START_BONUS : 0);
   const updates = {
@@ -596,30 +616,16 @@ function applyLandingEffect(tileIndex, seat, playerMoney, diceTotal, updates, lo
 
   if (tile.type === "free") {
     const pool = Number(roomState.taxPool || 0);
-    if (pool > 0) {
-      playerMoney += pool;
-      updates.taxPool = 0;
-      logs.push(`${player.name} masuk Parkir Bebas dan mengambil Uang Pajak ${formatMoney(pool)}.`);
-    } else {
-      logs.push(`${player.name} masuk Parkir Bebas. Uang Pajak masih kosong.`);
-    }
-
     const eligibleIndices = getFreeMoveEligibleIndices(roomState, seat);
-    if (eligibleIndices.length) {
-      updates.pendingAction = { type: "freeMove", seat, eligibleIndices };
-      updates.cardPopup = {
-        id: `${Date.now()}_${seat}_free_move`,
-        deckType: "system",
-        deck: "Parkir Bebas",
-        title: "PARKIR BEBAS",
-        text: `${player.name} boleh memilih 1 tanah tujuan yang menguntungkan. Klik tanah yang di-highlight kuning.`,
-        seat,
-        playerName: player.name
-      };
-      logs.push(`${player.name} mendapat bonus memilih 1 tanah tujuan dari Parkir Bebas.`);
-    } else {
-      logs.push(`${player.name} tidak memiliki tanah tujuan yang tersedia dari Parkir Bebas.`);
-    }
+
+    updates.pendingAction = {
+      type: "freeParkingChoice",
+      seat,
+      eligibleIndices
+    };
+    updates.cardPopup = makeFreeParkingPopup(player, pool);
+
+    logs.push(`${player.name} masuk Parkir Bebas dan harus memilih hadiah Uang Pajak atau pindah ke petak yang menguntungkan.`);
     return playerMoney;
   }
 
@@ -634,27 +640,154 @@ function applyLandingEffect(tileIndex, seat, playerMoney, diceTotal, updates, lo
   return playerMoney;
 }
 
+function normalizeTileIndices(value) {
+  if (Array.isArray(value)) {
+    return value.map(Number).filter(Number.isInteger);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.values(value).map(Number).filter(Number.isInteger);
+  }
+
+  return [];
+}
+
+function getClockwiseDistance(fromIndex, toIndex) {
+  const from = ((Number(fromIndex) % BOARD_SIZE) + BOARD_SIZE) % BOARD_SIZE;
+  const to = ((Number(toIndex) % BOARD_SIZE) + BOARD_SIZE) % BOARD_SIZE;
+  return (to - from + BOARD_SIZE) % BOARD_SIZE;
+}
+
+function doesClockwiseMovePassStart(fromIndex, toIndex) {
+  const from = ((Number(fromIndex) % BOARD_SIZE) + BOARD_SIZE) % BOARD_SIZE;
+  const distance = getClockwiseDistance(fromIndex, toIndex);
+
+  // Tidak ada perpindahan berarti tidak melewati START.
+  if (distance === 0) return false;
+
+  // Jika jumlah posisi awal + jarak mencapai/melewati ukuran papan,
+  // rute searah permainan telah melewati petak START (indeks 0).
+  return from + distance >= BOARD_SIZE;
+}
+
 function getFreeMoveEligibleIndices(stateLike = roomState, seat) {
   return BOARD
     .map((tile, index) => ({ tile, index }))
-    .filter(({ tile }) => tile.type === "property")
     .filter(({ tile }) => {
-      const propertyState = stateLike.propertyState?.[tile.propertyId] || { owner: null };
-      return propertyState.owner === null || Number(propertyState.owner) === Number(seat);
+      if (tile.type === "community" || tile.type === "chance") {
+        return true;
+      }
+
+      if (tile.type !== "property") {
+        return false;
+      }
+
+      const propertyState = stateLike?.propertyState?.[tile.propertyId] || { owner: null };
+      return propertyState.owner === null
+        || propertyState.owner === undefined
+        || Number(propertyState.owner) === Number(seat);
     })
     .map(({ index }) => index);
 }
 
+function makeFreeParkingPopup(player, pool) {
+  const rewardText = pool > 0
+    ? `Ambil hadiah Uang Pajak sebesar ${formatMoney(pool)}, atau pilih satu petak tujuan yang menguntungkan.`
+    : "Uang Pajak sedang kosong. Pilih satu petak tujuan yang menguntungkan.";
+
+  return {
+    id: `${Date.now()}_${player.seat}_free_parking_choice_${Math.random().toString(16).slice(2)}`,
+    deckType: "system",
+    deck: "Parkir Bebas",
+    title: "PARKIR BEBAS",
+    text: rewardText,
+    seat: Number(player.seat),
+    playerName: player.name
+  };
+}
+
+async function beginFreeMoveSelection() {
+  if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "freeParkingChoice") return;
+
+  const latest = (await roomRef.once("value")).val();
+  const action = latest?.pendingAction;
+  if (!latest || action?.type !== "freeParkingChoice" || Number(action.seat) !== Number(mySeat)) return;
+
+  const player = latest.players?.[mySeat];
+  if (!player) return;
+
+  const eligibleIndices = getFreeMoveEligibleIndices(latest, mySeat);
+  if (!eligibleIndices.length) {
+    await roomRef.update({ pendingAction: null, cardPopup: null, isRolling: false });
+    await addRemoteLog(`${player.name} tidak memiliki petak tujuan yang menguntungkan dari Parkir Bebas.`);
+    await finishTurn();
+    return;
+  }
+
+  localHiddenCardId = latest.cardPopup?.id || localHiddenCardId;
+  await roomRef.update({
+    pendingAction: {
+      type: "freeMove",
+      seat: mySeat,
+      eligibleIndices
+    },
+    cardPopup: null,
+    isRolling: false
+  });
+
+  await addRemoteLog(`${player.name} memilih bonus pindah petak dari Parkir Bebas. Petak yang menguntungkan sudah di-highlight.`);
+}
+
+async function collectFreeParkingTax() {
+  if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "freeParkingChoice") return;
+
+  const latest = (await roomRef.once("value")).val();
+  const action = latest?.pendingAction;
+  if (!latest || action?.type !== "freeParkingChoice" || Number(action.seat) !== Number(mySeat)) return;
+
+  const player = latest.players?.[mySeat];
+  if (!player) return;
+
+  const pool = Number(latest.taxPool || 0);
+  if (pool <= 0) return;
+
+  await roomRef.update({
+    [`players/${mySeat}/money`]: Number(player.money || 0) + pool,
+    taxPool: 0,
+    pendingAction: null,
+    cardPopup: null,
+    isRolling: false
+  });
+
+  await addRemoteLog(`${player.name} memilih hadiah Parkir Bebas dan mengambil Uang Pajak sebesar ${formatMoney(pool)}.`);
+  await finishTurn();
+}
+
 async function chooseFreeMoveTarget(tileIndex) {
-  if (!canIAct() || roomState?.pendingAction?.type !== "freeMove") return;
-  const player = roomState.players[mySeat];
+  if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "freeMove") return;
+
+  const latest = (await roomRef.once("value")).val();
+  const action = latest?.pendingAction;
+  if (!latest || action?.type !== "freeMove" || Number(action.seat) !== Number(mySeat)) return;
+
+  const allowed = normalizeTileIndices(action.eligibleIndices);
+  const normalizedIndex = Number(tileIndex);
+  if (!allowed.includes(normalizedIndex)) return;
+
+  const targetTile = BOARD[normalizedIndex];
+  const isBeneficialTarget = targetTile
+    && (targetTile.type === "community"
+      || targetTile.type === "chance"
+      || targetTile.type === "property");
+  if (!isBeneficialTarget) return;
+
+  roomState = latest;
+  const player = latest.players?.[mySeat];
+  if (!player) return;
+
   const currentPos = Number(player.position || 0);
-  const targetTile = BOARD[tileIndex];
-  if (!targetTile || targetTile.type !== "property") return;
-
-  const allowed = roomState.pendingAction.eligibleIndices || [];
-  if (!allowed.includes(tileIndex)) return;
-
+  const clockwiseDistance = getClockwiseDistance(currentPos, normalizedIndex);
+  const passedStart = doesClockwiseMovePassStart(currentPos, normalizedIndex);
   const updates = {
     pendingAction: null,
     cardPopup: null,
@@ -663,34 +796,56 @@ async function chooseFreeMoveTarget(tileIndex) {
   let playerMoney = Number(player.money || 0);
   const moveId = `${Date.now()}_${mySeat}_free_${Math.random().toString(16).slice(2)}`;
 
-  updates[`players/${mySeat}/position`] = tileIndex;
+  if (passedStart) {
+    playerMoney += PASS_START_BONUS;
+  }
+
+  updates[`players/${mySeat}/position`] = normalizedIndex;
   updates[`players/${mySeat}/money`] = playerMoney;
   updates.lastMove = {
     id: moveId,
     seat: mySeat,
     from: currentPos,
-    to: tileIndex,
-    steps: 0,
+    to: normalizedIndex,
+    steps: clockwiseDistance,
     direct: true,
+    duration: 620,
+    passedStart,
+    startBonus: passedStart ? PASS_START_BONUS : 0,
     createdAt: Date.now()
   };
 
-  const logs = [`${player.name} memilih ${PROPERTY_DATA[targetTile.propertyId].name} dari bonus Parkir Bebas.`];
-  playerMoney = handlePropertyLanding(targetTile.propertyId, mySeat, playerMoney, Number(roomState.lastRoulette?.result || 7), updates, logs);
+  const targetName = getTileName(targetTile);
+  const logs = [`${player.name} memilih ${targetName} sebagai tujuan bonus Parkir Bebas.`];
+
+  if (passedStart) {
+    logs.push(`${player.name} melewati START menuju ${targetName} dan menerima ${formatMoney(PASS_START_BONUS)}.`);
+  }
+
+  playerMoney = applyLandingEffect(
+    normalizedIndex,
+    mySeat,
+    playerMoney,
+    Number(latest.lastRoulette?.result || 7),
+    updates,
+    logs
+  );
   updates[`players/${mySeat}/money`] = playerMoney;
 
   await roomRef.update(updates);
   await addLogs(logs);
 
   setTimeout(async () => {
-    const latest = (await roomRef.once("value")).val();
-    if (!latest) return;
-    if (latest.pendingAction) {
-      await roomRef.update({ isRolling: false });
-      return;
+    const current = (await roomRef.once("value")).val();
+    if (!current?.lastMove || current.lastMove.id !== moveId) return;
+
+    await roomRef.update({ isRolling: false });
+
+    const afterUnlock = (await roomRef.once("value")).val();
+    if (!afterUnlock?.pendingAction) {
+      await finishTurn();
     }
-    await finishTurn();
-  }, 500);
+  }, 680);
 }
 
 function drawAndApplyCard(tileType, seat, playerMoney, updates, logs) {
@@ -758,6 +913,16 @@ function applyCardEffect(card, seat, playerMoney, updates, logs) {
     updates[`players/${seat}/inJail`] = true;
     updates[`players/${seat}/jailAttempts`] = 0;
     logs.push(`${player.name} langsung masuk penjara.`);
+    return playerMoney;
+  }
+
+  if (effect.type === "moveToFreeParking") {
+    updates.pendingAction = {
+      type: "cardFreeParking",
+      seat,
+      cardId: updates.cardPopup?.id || ""
+    };
+    logs.push(`${player.name} akan menuju Parkir Bebas setelah kartu ditutup.`);
     return playerMoney;
   }
 
@@ -1090,10 +1255,14 @@ function renderUI() {
     els.statusText.textContent = "Pion sedang berjalan. Tunggu sampai animasi selesai.";
   } else if (roomState.pendingAction) {
     const actor = players[roomState.pendingAction.seat];
-    if (roomState.pendingAction.type === "freeMove") {
+    if (roomState.pendingAction.type === "freeParkingChoice") {
       els.statusText.textContent = Number(roomState.currentSeat) === Number(mySeat)
-        ? "Kamu mendapat bonus Parkir Bebas. Klik tanah yang di-highlight."
-        : `${actor?.name || "Pemain aktif"} sedang memilih tanah bonus dari Parkir Bebas.`;
+        ? "Parkir Bebas: pilih hadiah Uang Pajak atau pilih petak tujuan."
+        : `${actor?.name || "Pemain aktif"} sedang memilih bonus Parkir Bebas.`;
+    } else if (roomState.pendingAction.type === "freeMove") {
+      els.statusText.textContent = Number(roomState.currentSeat) === Number(mySeat)
+        ? "Klik salah satu petak yang di-highlight kuning."
+        : `${actor?.name || "Pemain aktif"} sedang memilih petak tujuan dari Parkir Bebas.`;
     } else {
       els.statusText.textContent = `Menunggu aksi dari ${actor?.name || "pemain aktif"}.`;
     }
@@ -1185,14 +1354,26 @@ function renderActionPanel() {
     return;
   }
 
-  if (action.type === "freeMove") {
-    const totalChoices = (action.eligibleIndices || []).length;
+  if (action.type === "freeParkingChoice") {
+    const pool = Number(roomState.taxPool || 0);
+    const totalChoices = normalizeTileIndices(action.eligibleIndices).length;
     els.actionPanel.innerHTML = `
       <div class="action-title">PARKIR BEBAS</div>
-      <div class="action-sub">Klik salah satu tanah yang di-highlight kuning di papan. Tanah yang bisa dipilih hanya tanah yang belum dimiliki pemain lain atau milikmu sendiri. Pilihan tersedia: ${totalChoices} tanah.</div>
-      <div class="action-row single">
-        <button class="gold" onclick="hideCardPopupLocal()">Tutup Popup Bantuan</button>
+      <div class="action-sub">Pilih satu hadiah. Mengambil Uang Pajak akan mengakhiri giliran. Memilih petak akan menampilkan highlight pada tanah kosong, tanah milikmu, Dana Umum, dan Kesempatan.</div>
+      <div class="price-pill">Uang Pajak: ${formatMoney(pool)} • ${totalChoices} petak menguntungkan</div>
+      <div class="action-row">
+        <button class="gold" onclick="collectFreeParkingTax()" ${enabled && pool > 0 ? "" : "disabled"}>Ambil Uang Pajak</button>
+        <button class="primary" onclick="beginFreeMoveSelection()" ${enabled && totalChoices > 0 ? "" : "disabled"}>Pilih Petak Tujuan</button>
       </div>
+    `;
+    return;
+  }
+
+  if (action.type === "freeMove") {
+    const totalChoices = normalizeTileIndices(action.eligibleIndices).length;
+    els.actionPanel.innerHTML = `
+      <div class="action-title">PILIH PETAK TUJUAN</div>
+      <div class="action-sub">Klik salah satu petak yang di-highlight kuning. Petak tujuan yang rutenya melewati START memberi bonus $200. Petak lawan, pajak, penjara, Masuk Penjara, START, dan Parkir Bebas tidak dapat dipilih. Pilihan tersedia: ${totalChoices} petak.</div>
     `;
     return;
   }
@@ -1257,33 +1438,264 @@ function renderRouletteUI() {
   }
 }
 
+function waitForMoneyAnimation(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function resetPlayerMoneyAnimations() {
+  moneyAnimationGeneration += 1;
+
+  playerMoneyAnimationStates.forEach(state => {
+    if (state?.settleTimer) {
+      clearTimeout(state.settleTimer);
+    }
+  });
+
+  playerMoneyAnimationStates.clear();
+}
+
+function getMoneyAnimationElements(seat) {
+  const row = els.playersList?.querySelector(`.player-row[data-seat="${Number(seat)}"]`);
+  if (!row) return { row: null, money: null, change: null };
+
+  return {
+    row,
+    money: row.querySelector('[data-role="money"]'),
+    change: row.querySelector('[data-role="money-change"]')
+  };
+}
+
+function setDisplayedPlayerMoney(seat, value, animate = false) {
+  const { money } = getMoneyAnimationElements(seat);
+  if (!money) return;
+
+  money.textContent = formatMoney(value);
+
+  if (animate) {
+    money.classList.remove("money-value-pop");
+    void money.offsetWidth;
+    money.classList.add("money-value-pop");
+
+    // Kelas dibersihkan setelah animasi agar render Firebase berikutnya
+    // tidak menghidupkan kembali efek pop secara tidak sengaja.
+    money.addEventListener("animationend", () => {
+      money.classList.remove("money-value-pop");
+    }, { once: true });
+  }
+}
+
+function unlockMoneyAudio() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return null;
+
+    if (!moneyAudioContext) {
+      moneyAudioContext = new AudioContextClass();
+    }
+
+    if (moneyAudioContext.state === "suspended") {
+      moneyAudioContext.resume().catch(() => {});
+    }
+
+    return moneyAudioContext;
+  } catch (error) {
+    return null;
+  }
+}
+
+function playMoneyChangeSound(delta) {
+  const audioContext = unlockMoneyAudio();
+  if (!audioContext || audioContext.state !== "running") return;
+
+  const isGain = Number(delta) > 0;
+  const now = audioContext.currentTime;
+  const masterGain = audioContext.createGain();
+
+  // Satu transaksi menghasilkan satu bunyi. Dua oscillator ditumpuk pada
+  // waktu yang sama untuk memberi karakter koin, bukan dimainkan berurutan.
+  masterGain.gain.setValueAtTime(0.0001, now);
+  masterGain.gain.exponentialRampToValueAtTime(isGain ? 0.065 : 0.05, now + 0.008);
+  masterGain.gain.exponentialRampToValueAtTime(0.0001, now + (isGain ? 0.24 : 0.28));
+  masterGain.connect(audioContext.destination);
+
+  const frequencies = isGain ? [1046.5, 2093] : [330, 220];
+
+  frequencies.forEach((frequency, index) => {
+    const oscillator = audioContext.createOscillator();
+    const noteGain = audioContext.createGain();
+    const stopAt = now + (isGain ? 0.18 : 0.22);
+
+    oscillator.type = isGain ? (index === 0 ? "sine" : "triangle") : "triangle";
+    oscillator.frequency.setValueAtTime(frequency, now);
+    oscillator.frequency.exponentialRampToValueAtTime(
+      isGain ? frequency * 1.02 : Math.max(90, frequency * 0.82),
+      stopAt
+    );
+
+    noteGain.gain.setValueAtTime(index === 0 ? 0.65 : 0.32, now);
+    noteGain.gain.exponentialRampToValueAtTime(0.0001, stopAt);
+
+    oscillator.connect(noteGain);
+    noteGain.connect(masterGain);
+    oscillator.start(now);
+    oscillator.stop(stopAt + 0.02);
+  });
+}
+
+function queuePlayerMoneyChange(seat, nextMoney) {
+  const normalizedSeat = Number(seat);
+  const normalizedMoney = Number(nextMoney || 0);
+  let state = playerMoneyAnimationStates.get(normalizedSeat);
+
+  if (!state) {
+    state = {
+      displayed: normalizedMoney,
+      observed: normalizedMoney,
+      queue: [],
+      running: false,
+      activeDelta: 0,
+      settleTimer: null
+    };
+    playerMoneyAnimationStates.set(normalizedSeat, state);
+    return state;
+  }
+
+  if (normalizedMoney !== state.observed) {
+    state.queue.push({
+      from: state.observed,
+      to: normalizedMoney,
+      delta: normalizedMoney - state.observed
+    });
+    state.observed = normalizedMoney;
+    runPlayerMoneyAnimationQueue(normalizedSeat);
+  }
+
+  return state;
+}
+
+async function runPlayerMoneyAnimationQueue(seat) {
+  const state = playerMoneyAnimationStates.get(Number(seat));
+  if (!state || state.running) return;
+
+  state.running = true;
+  const generation = moneyAnimationGeneration;
+
+  while (state.queue.length && generation === moneyAnimationGeneration) {
+    const changeData = state.queue.shift();
+    const delta = Number(changeData.delta || 0);
+
+    if (!delta) {
+      state.displayed = Number(changeData.to || 0);
+      setDisplayedPlayerMoney(seat, state.displayed);
+      continue;
+    }
+
+    state.displayed = Number(changeData.from || 0);
+    state.activeDelta = delta;
+    setDisplayedPlayerMoney(seat, state.displayed);
+
+    const { change } = getMoneyAnimationElements(seat);
+    if (change) {
+      change.textContent = `${delta > 0 ? "+" : "-"}${formatMoney(Math.abs(delta))}`;
+      change.classList.remove("money-change-gain", "money-change-loss", "money-change-play");
+      change.classList.add(delta > 0 ? "money-change-gain" : "money-change-loss");
+      void change.offsetWidth;
+      change.classList.add("money-change-play");
+    }
+
+    playMoneyChangeSound(delta);
+
+    // Indikator muncul, bertahan, lalu benar-benar menghilang.
+    await waitForMoneyAnimation(1120);
+    if (generation !== moneyAnimationGeneration) return;
+
+    if (change) {
+      change.classList.remove("money-change-play", "money-change-gain", "money-change-loss");
+      change.textContent = "";
+    }
+
+    // Saldo baru baru ditampilkan setelah indikator selesai menghilang.
+    state.displayed = Number(changeData.to || 0);
+    state.activeDelta = 0;
+    setDisplayedPlayerMoney(seat, state.displayed, true);
+    await waitForMoneyAnimation(280);
+  }
+
+  state.running = false;
+}
+
+function createPlayerRow(seat) {
+  const row = document.createElement("div");
+  row.className = "player-row";
+  row.dataset.seat = String(Number(seat));
+  row.innerHTML = `
+    <div class="player-dot" data-role="dot"></div>
+    <div class="player-main">
+      <div class="player-name" data-role="name"></div>
+      <div class="player-sub" data-role="sub"></div>
+    </div>
+    <div class="money-wrap">
+      <div class="money" data-role="money">$0</div>
+      <div class="money-change" data-role="money-change" aria-live="polite"></div>
+    </div>
+    <div class="owned-tags" data-role="owned"></div>
+  `;
+  return row;
+}
+
 function renderPlayersList(players) {
   const visiblePlayers = Object.values(players)
     .filter(player => player.connected)
     .sort((a, b) => Number(a.seat) - Number(b.seat));
+  const visibleSeats = new Set(visiblePlayers.map(player => Number(player.seat)));
 
-  els.playersList.innerHTML = visiblePlayers
-    .map(player => {
-      const ownedIds = getOwnedPropertyIds(player.seat);
-      const ownedTags = ownedIds.slice(0, 6).map(id => {
-        const property = PROPERTY_DATA[id];
-        const ps = getPropertyState(id);
-        const level = property.kind === "city" ? ` ${RENT_LABELS[Number(ps.level || 0)]}` : "";
-        return `<span class="owned-tag">${escapeHTML(property.name)}${level}</span>`;
-      }).join("");
+  els.playersList.querySelectorAll(".player-row[data-seat]").forEach(row => {
+    if (!visibleSeats.has(Number(row.dataset.seat))) {
+      row.remove();
+    }
+  });
 
-      return `
-        <div class="player-row ${Number(player.seat) === Number(roomState.currentSeat) ? "active" : ""}">
-          <div class="player-dot" style="background:${player.color}">${Number(player.seat) + 1}</div>
-          <div class="player-main">
-            <div class="player-name">${escapeHTML(player.name)}</div>
-            <div class="player-sub">Petak ${player.position || 0} • ${player.connected ? "Online" : "Kosong"} • Tanah ${ownedIds.length}${player.inJail ? ` • Penjara ${Number(player.jailAttempts || 0)}/3` : ""}</div>
-          </div>
-          <div class="money">${formatMoney(player.money || 0)}</div>
-          <div class="owned-tags">${ownedTags || `<span class="owned-tag">Belum punya tanah</span>`}</div>
-        </div>
-      `;
+  visiblePlayers.forEach((player, playerIndex) => {
+    const seat = Number(player.seat);
+    let row = els.playersList.querySelector(`.player-row[data-seat="${seat}"]`);
+
+    if (!row) {
+      row = createPlayerRow(seat);
+      els.playersList.appendChild(row);
+    }
+
+    // Jangan append ulang row pada setiap snapshot Firebase. Memindahkan node
+    // yang sama dapat me-restart CSS animation dan membuat seluruh Data Pemain
+    // tampak berkedip ketika pion sedang berjalan.
+    const rowAtExpectedPosition = els.playersList.children[playerIndex];
+    if (rowAtExpectedPosition !== row) {
+      els.playersList.insertBefore(row, rowAtExpectedPosition || null);
+    }
+
+    const ownedIds = getOwnedPropertyIds(player.seat);
+    const ownedTags = ownedIds.slice(0, 6).map(id => {
+      const property = PROPERTY_DATA[id];
+      const ps = getPropertyState(id);
+      const level = property.kind === "city" ? ` ${RENT_LABELS[Number(ps.level || 0)]}` : "";
+      return `<span class="owned-tag">${escapeHTML(property.name)}${level}</span>`;
     }).join("");
+
+    row.classList.toggle("active", seat === Number(roomState.currentSeat));
+
+    const dot = row.querySelector('[data-role="dot"]');
+    const name = row.querySelector('[data-role="name"]');
+    const sub = row.querySelector('[data-role="sub"]');
+    const owned = row.querySelector('[data-role="owned"]');
+
+    dot.style.background = player.color;
+    dot.textContent = String(seat + 1);
+    name.textContent = player.name;
+    sub.textContent = `Petak ${player.position || 0} • ${player.connected ? "Online" : "Kosong"} • Tanah ${ownedIds.length}${player.inJail ? ` • Penjara ${Number(player.jailAttempts || 0)}/3` : ""}`;
+    owned.innerHTML = ownedTags || `<span class="owned-tag">Belum punya tanah</span>`;
+
+    const moneyState = queuePlayerMoneyChange(seat, player.money);
+    setDisplayedPlayerMoney(seat, moneyState.displayed);
+  });
 }
 
 function renderLogs() {
@@ -1316,8 +1728,29 @@ function renderCardPopup() {
   els.cardTitle.textContent = popup.title || "Info";
   els.cardText.textContent = popup.text || "";
 
-  const isBlockingPopup = roomState.pendingAction?.type === "card" || roomState.pendingAction?.type === "taxPopup";
-  const isActor = canIAct() && isBlockingPopup;
+  const actionType = roomState.pendingAction?.type;
+  const isBlockingPopup = ["card", "taxPopup", "cardFreeParking"].includes(actionType);
+  const isActor = canIAct();
+
+  els.cardActions.innerHTML = "";
+  els.cardActions.classList.add("hidden");
+  els.cardContinueBtn.classList.remove("hidden");
+
+  if (actionType === "freeParkingChoice") {
+    const pool = Number(roomState.taxPool || 0);
+    const totalChoices = normalizeTileIndices(roomState.pendingAction?.eligibleIndices).length;
+    els.cardActions.classList.remove("hidden");
+    els.cardActions.innerHTML = `
+      <button class="gold" type="button" onclick="collectFreeParkingTax()" ${isActor && pool > 0 ? "" : "disabled"}>
+        Ambil Uang Pajak ${formatMoney(pool)}
+      </button>
+      <button class="primary" type="button" onclick="beginFreeMoveSelection()" ${isActor && totalChoices > 0 ? "" : "disabled"}>
+        Pilih Petak Tujuan
+      </button>
+    `;
+    els.cardContinueBtn.classList.add("hidden");
+    return;
+  }
 
   if (isBlockingPopup) {
     els.cardContinueBtn.textContent = isActor ? "Tutup & Lanjutkan" : "Menunggu Pemain Aktif";
@@ -1337,15 +1770,94 @@ function hideCardPopupLocal() {
 
   els.cardOverlay.classList.add("hidden");
   els.cardText.textContent = "";
+  els.cardActions.innerHTML = "";
+  els.cardActions.classList.add("hidden");
+  els.cardContinueBtn.classList.remove("hidden");
+}
+
+async function resolveFreeParkingCard() {
+  if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "cardFreeParking") return;
+
+  const latest = (await roomRef.once("value")).val();
+  const action = latest?.pendingAction;
+  if (!latest || action?.type !== "cardFreeParking" || Number(action.seat) !== Number(mySeat)) return;
+
+  const player = latest.players?.[mySeat];
+  if (!player) return;
+
+  const from = Number(player.position || 0);
+  const target = 20;
+  const pool = Number(latest.taxPool || 0);
+  const eligibleIndices = getFreeMoveEligibleIndices(latest, mySeat);
+  const moveId = `${Date.now()}_${mySeat}_card_free_parking_${Math.random().toString(16).slice(2)}`;
+  const updates = {
+    isRolling: true,
+    cardPopup: makeFreeParkingPopup(player, pool),
+    lastMove: {
+      id: moveId,
+      seat: mySeat,
+      from,
+      to: target,
+      steps: 0,
+      direct: true,
+      duration: 720,
+      createdAt: Date.now()
+    },
+    pendingAction: {
+      type: "freeParkingChoice",
+      seat: mySeat,
+      eligibleIndices
+    }
+  };
+
+  updates[`players/${mySeat}/position`] = target;
+
+  await roomRef.update(updates);
+  await addLogs([
+    `${player.name} berpindah ke Parkir Bebas dari kartu Kesempatan.`,
+    `${player.name} harus memilih hadiah Uang Pajak atau pindah ke petak yang menguntungkan.`
+  ]);
+
+  setTimeout(async () => {
+    const current = (await roomRef.once("value")).val();
+    if (!current?.lastMove || current.lastMove.id !== moveId) return;
+    await roomRef.update({ isRolling: false });
+  }, 780);
 }
 
 async function closeCardAndFinishTurn() {
-  if (localPopupOpen || !roomState?.pendingAction) {
+  if (localPopupOpen) {
     hideCardPopupLocal();
     return;
   }
 
-  if (!canIAct() || !["card", "taxPopup"].includes(roomState.pendingAction?.type)) return;
+  const actionType = roomState?.pendingAction?.type;
+  if (!actionType) {
+    hideCardPopupLocal();
+    return;
+  }
+
+  if (actionType === "freeMove" || actionType === "freeParkingChoice") {
+    hideCardPopupLocal();
+    return;
+  }
+
+  if (!canIAct()) {
+    const blockingForMe = ["card", "taxPopup", "cardFreeParking"].includes(actionType)
+      && Number(roomState?.pendingAction?.seat) === Number(mySeat);
+
+    if (!blockingForMe) {
+      hideCardPopupLocal();
+    }
+    return;
+  }
+
+  if (actionType === "cardFreeParking") {
+    await resolveFreeParkingCard();
+    return;
+  }
+
+  if (!["card", "taxPopup"].includes(actionType)) return;
 
   const actor = roomState.players[mySeat];
 
@@ -1368,6 +1880,9 @@ function showPropertyDetailPopup(propertyId) {
   const currentRent = owner ? calculateRent(propertyId, roomState?.lastDice?.[0] + roomState?.lastDice?.[1] || 7, roomState) : 0;
 
   localPopupOpen = true;
+  els.cardActions.innerHTML = "";
+  els.cardActions.classList.add("hidden");
+  els.cardContinueBtn.classList.remove("hidden");
   els.cardOverlay.classList.remove("hidden");
   els.cardPopup.className = "card-popup property-detail";
   els.cardDeckLabel.textContent = "Detail Tanah";
@@ -1426,7 +1941,7 @@ function maybeAnimateLastMove() {
 
   lastAnimatedMoveId = move.id;
   if (move.direct) {
-    gameScene.setPawnPosition(move.seat, move.to, false);
+    gameScene.animatePawnDirect(move.seat, move.from, move.to, Number(move.duration || 420));
     return;
   }
   gameScene.animatePawnMove(move.seat, move.from, move.steps);
@@ -1458,6 +1973,9 @@ class BoardScene extends Phaser.Scene {
     this.taxAmountText = null;
     this.tileSize = 56;
     this.tileShade = null;
+    this.freeMoveCenterShade = null;
+    this.freeMoveHint = null;
+    this.propertyMarkerSignature = "";
   }
 
   create() {
@@ -1478,9 +1996,14 @@ class BoardScene extends Phaser.Scene {
     const width = this.scale.width;
     const height = this.scale.height;
 
+    this.tweens.killAll();
+    this.animatingSeats.clear();
     this.children.removeAll();
+    this.tiles = [];
+    this.pawns = {};
+    this.propertyMarkerSignature = "";
 
-    const size = Math.min(width, height) - 34;
+    const size = Math.max(140, Math.min(width, height) - 34);
     const startX = (width - size) / 2;
     const startY = (height - size) / 2;
     const cells = 11;
@@ -1565,19 +2088,21 @@ class BoardScene extends Phaser.Scene {
       rect.setInteractive({ useHandCursor: true });
       rect.on("pointerdown", () => {
         if (roomState?.pendingAction?.type === "freeMove") {
-          const allowed = roomState.pendingAction.eligibleIndices || [];
+          const allowed = normalizeTileIndices(roomState.pendingAction.eligibleIndices);
           if (allowed.includes(i) && Number(roomState.pendingAction.seat) === Number(mySeat)) {
             chooseFreeMoveTarget(i);
             return;
           }
+          return;
         }
         if (boardTile.type === "property") {
           showPropertyDetailPopup(boardTile.propertyId);
         }
       });
 
+      let colorBand = null;
       if (property && property.kind === "city") {
-        const colorBand = this.add.rectangle(x, y - tile * .36, tile - 4, tile * .15, Phaser.Display.Color.HexStringToColor(property.color).color);
+        colorBand = this.add.rectangle(x, y - tile * .36, tile - 4, tile * .15, Phaser.Display.Color.HexStringToColor(property.color).color);
         colorBand.setStrokeStyle(.5, 0x14213d);
       }
 
@@ -1591,10 +2116,84 @@ class BoardScene extends Phaser.Scene {
       });
       label.setOrigin(.5);
 
-      this.tiles[i] = { x, y, rect, label, boardTile, index: i };
+      const highlight = this.add.rectangle(x, y, tile - 4, tile - 4, 0xffc928, 0);
+      highlight.setStrokeStyle(Math.max(3, tile * .055), 0xffb300);
+      highlight.setDepth(52);
+      highlight.setVisible(false);
+
+      const startBonusBadge = this.add.text(x, y + tile * .30, "+$200", {
+        fontFamily: "Arial",
+        fontSize: `${Math.max(7, Math.floor(tile * .13))}px`,
+        fontStyle: "bold",
+        color: "#ffffff",
+        backgroundColor: "#0f6b4f",
+        padding: {
+          x: Math.max(2, Math.floor(tile * .05)),
+          y: Math.max(1, Math.floor(tile * .025))
+        }
+      });
+      startBonusBadge.setOrigin(.5);
+      startBonusBadge.setDepth(54);
+      startBonusBadge.setVisible(false);
+
+      this.tiles[i] = {
+        x,
+        y,
+        rect,
+        label,
+        colorBand,
+        highlight,
+        startBonusBadge,
+        ownerMarker: null,
+        boardTile,
+        index: i,
+        visualObjects: [rect, colorBand, label].filter(Boolean)
+      };
     }
 
-    this.pawns = {};
+    this.freeMoveCenterShade = this.add.rectangle(
+      startX + tile * 5.5,
+      startY + tile * 5.5,
+      tile * 9,
+      tile * 9,
+      0x0f172a,
+      0.62
+    );
+    this.freeMoveCenterShade.setDepth(48);
+    this.freeMoveCenterShade.setVisible(false);
+
+    const hintBg = this.add.graphics();
+    const hintWidth = tile * 5.5;
+    const hintHeight = tile * 2.02;
+    hintBg.fillStyle(0xffbd59, 1);
+    hintBg.lineStyle(Math.max(4, tile * .09), 0x050505, 1);
+    hintBg.fillRoundedRect(-hintWidth / 2, -hintHeight / 2, hintWidth, hintHeight, tile * .32);
+    hintBg.strokeRoundedRect(-hintWidth / 2, -hintHeight / 2, hintWidth, hintHeight, tile * .32);
+
+    const hintTitle = this.add.text(0, -tile * .18, "PARKIR BEBAS", {
+      fontFamily: "Arial",
+      fontSize: `${Math.max(16, Math.floor(tile * .38))}px`,
+      fontStyle: "bold",
+      color: "#050505",
+      align: "center"
+    }).setOrigin(.5);
+
+    const hintText = this.add.text(0, tile * .34, "PILIH PETAK YANG DI-HIGHLIGHT KUNING\nLABEL +$200 = MELEWATI START", {
+      fontFamily: "Arial",
+      fontSize: `${Math.max(10, Math.floor(tile * .19))}px`,
+      color: "#050505",
+      align: "center",
+      wordWrap: { width: hintWidth * .84 }
+    }).setOrigin(.5);
+
+    this.freeMoveHint = this.add.container(
+      startX + tile * 5.5,
+      startY + tile * 5.5,
+      [hintBg, hintTitle, hintText]
+    );
+    this.freeMoveHint.setDepth(60);
+    this.freeMoveHint.setVisible(false);
+
   }
 
   getTileCell(index) {
@@ -1665,6 +2264,7 @@ class BoardScene extends Phaser.Scene {
         }
       });
 
+    this.refreshPropertyMarkers(state);
     this.refreshTileHighlights(state);
   }
 
@@ -1685,6 +2285,7 @@ class BoardScene extends Phaser.Scene {
     text.setOrigin(.5);
 
     container.add([circle, text]);
+    container.setDepth(70);
     this.pawns[seat] = container;
   }
 
@@ -1708,6 +2309,38 @@ class BoardScene extends Phaser.Scene {
     }
   }
 
+
+  animatePawnDirect(seat, from, to, duration = 420) {
+    const pawn = this.pawns[seat];
+    if (!pawn || !this.tiles.length) return;
+
+    this.animatingSeats.add(Number(seat));
+    this.tweens.killTweensOf(pawn);
+    pawn.setScale(1);
+    this.setPawnPosition(seat, from, false);
+
+    const target = this.getPawnTarget(seat, to);
+    this.tweens.add({
+      targets: pawn,
+      x: target.x,
+      y: target.y,
+      duration: Math.max(220, duration),
+      ease: "Sine.easeInOut",
+      onComplete: () => {
+        this.setPawnPosition(seat, to, false);
+        this.animatingSeats.delete(Number(seat));
+      }
+    });
+
+    this.tweens.add({
+      targets: pawn,
+      scaleX: 1.14,
+      scaleY: 1.14,
+      duration: Math.max(110, duration / 2),
+      yoyo: true,
+      ease: "Sine.easeOut"
+    });
+  }
 
   animatePawnMove(seat, from, steps) {
     const pawn = this.pawns[seat];
@@ -1759,21 +2392,179 @@ class BoardScene extends Phaser.Scene {
     this.time.delayedCall(100, moveOneStep);
   }
 
+  getPropertyMarkerSignature(state) {
+    const propertyPart = Object.keys(PROPERTY_DATA)
+      .map((propertyId) => {
+        const ps = state?.propertyState?.[propertyId] || {};
+        return `${propertyId}:${ps.owner ?? "-"}:${Number(ps.level || 0)}`;
+      })
+      .join("|");
+
+    const playerColorPart = Object.values(state?.players || {})
+      .map((player) => `${player.seat}:${player.color || ""}`)
+      .sort()
+      .join("|");
+
+    return `${propertyPart}__${playerColorPart}`;
+  }
+
+  refreshPropertyMarkers(state) {
+    const signature = this.getPropertyMarkerSignature(state);
+    if (signature === this.propertyMarkerSignature) return;
+    this.propertyMarkerSignature = signature;
+
+    this.tiles.forEach((tileObj) => {
+      if (tileObj?.ownerMarker) {
+        tileObj.ownerMarker.destroy(true);
+        tileObj.ownerMarker = null;
+      }
+
+      const boardTile = tileObj?.boardTile;
+      if (!boardTile || boardTile.type !== "property") return;
+
+      const propertyId = boardTile.propertyId;
+      const property = PROPERTY_DATA[propertyId];
+      const ps = state?.propertyState?.[propertyId] || { owner: null, level: 0 };
+      if (ps.owner === null || ps.owner === undefined || ps.owner === "") return;
+
+      const owner = state?.players?.[ps.owner];
+      const ownerColor = Phaser.Display.Color.HexStringToColor(
+        owner?.color || PLAYER_COLORS[Number(ps.owner)] || "#0f6b4f"
+      ).color;
+
+      tileObj.ownerMarker = this.createPropertyOwnerMarker(
+        tileObj.index,
+        property,
+        Number(ps.level || 0),
+        ownerColor
+      );
+    });
+  }
+
+  createPropertyOwnerMarker(tileIndex, property, level, ownerColor) {
+    const marker = this.add.container(this.tiles[tileIndex].x, this.tiles[tileIndex].y);
+    marker.setDepth(44);
+
+    const tile = this.tileSize;
+    const side = this.getPropertyMarkerSide(tileIndex);
+    const isVertical = side === "left" || side === "right";
+    const dotX = -tile * 0.32;
+    const dotY = tile * 0.30;
+    const dotRadius = Math.max(3.4, tile * 0.075);
+    const houseSize = Math.max(3.8, tile * 0.082);
+    const gap = Math.max(1.5, tile * 0.025);
+    const step = houseSize + gap;
+
+    const dotShadow = this.add.circle(
+      dotX + Math.max(1, tile * 0.018),
+      dotY + Math.max(1, tile * 0.018),
+      dotRadius,
+      0x000000,
+      0.28
+    );
+    const ownerDot = this.add.circle(dotX, dotY, dotRadius, ownerColor);
+    ownerDot.setStrokeStyle(Math.max(1.2, tile * 0.025), 0xffffff);
+    marker.add([dotShadow, ownerDot]);
+
+    if (property.kind !== "city" || level <= 0) {
+      return marker;
+    }
+
+    const buildStart = dotRadius + tile * 0.085;
+
+    if (level >= 5) {
+      const hotelLong = Math.max(11, tile * 0.29);
+      const hotelShort = Math.max(5, tile * 0.105);
+      const hotelX = isVertical ? dotX : dotX + buildStart + hotelLong / 2;
+      const hotelY = isVertical ? dotY - buildStart - hotelLong / 2 : dotY;
+      const hotelWidth = isVertical ? hotelShort : hotelLong;
+      const hotelHeight = isVertical ? hotelLong : hotelShort;
+
+      const hotelShadow = this.add.rectangle(
+        hotelX + Math.max(1, tile * 0.015),
+        hotelY + Math.max(1, tile * 0.015),
+        hotelWidth,
+        hotelHeight,
+        0x000000,
+        0.25
+      );
+      const hotel = this.add.rectangle(hotelX, hotelY, hotelWidth, hotelHeight, ownerColor);
+      hotel.setStrokeStyle(Math.max(1, tile * 0.022), 0xffffff);
+      marker.add([hotelShadow, hotel]);
+      return marker;
+    }
+
+    const houseCount = Math.min(4, Math.max(0, level));
+    for (let index = 0; index < houseCount; index++) {
+      const houseX = isVertical ? dotX : dotX + buildStart + index * step;
+      const houseY = isVertical ? dotY - buildStart - index * step : dotY;
+      const houseShadow = this.add.rectangle(
+        houseX + Math.max(0.8, tile * 0.012),
+        houseY + Math.max(0.8, tile * 0.012),
+        houseSize,
+        houseSize,
+        0x000000,
+        0.25
+      );
+      const house = this.add.rectangle(houseX, houseY, houseSize, houseSize, ownerColor);
+      house.setStrokeStyle(Math.max(0.9, tile * 0.018), 0xffffff);
+      marker.add([houseShadow, house]);
+    }
+
+    return marker;
+  }
+
+  getPropertyMarkerSide(index) {
+    if (index > 0 && index < 10) return "bottom";
+    if (index > 10 && index < 20) return "left";
+    if (index > 20 && index < 30) return "top";
+    if (index > 30 && index < 40) return "right";
+    return "corner";
+  }
+
   refreshTileHighlights(state) {
     const freeMove = state?.pendingAction?.type === "freeMove" ? state.pendingAction : null;
-    const allowed = new Set(freeMove?.eligibleIndices || []);
+    const allowed = new Set(normalizeTileIndices(freeMove?.eligibleIndices));
+    const actorPosition = freeMove
+      ? Number(state?.players?.[freeMove.seat]?.position ?? 20)
+      : 20;
+
+    if (this.freeMoveCenterShade) {
+      this.freeMoveCenterShade.setVisible(Boolean(freeMove));
+    }
+    if (this.freeMoveHint) {
+      this.freeMoveHint.setVisible(Boolean(freeMove));
+    }
+
     this.tiles.forEach((tileObj) => {
       if (!tileObj?.rect) return;
       const isAllowed = allowed.has(tileObj.index);
-      if (freeMove) {
-        tileObj.rect.setAlpha(isAllowed ? 1 : 0.42);
-        if (tileObj.label) tileObj.label.setAlpha(isAllowed ? 1 : 0.42);
-        tileObj.rect.setStrokeStyle(isAllowed ? 3.5 : 1.3, isAllowed ? 0xf3c34d : 0x14213d);
-      } else {
-        tileObj.rect.setAlpha(1);
-        if (tileObj.label) tileObj.label.setAlpha(1);
-        tileObj.rect.setStrokeStyle(1.3, 0x14213d);
+      const alpha = freeMove ? (isAllowed ? 1 : 0.20) : 1;
+
+      (tileObj.visualObjects || [tileObj.rect, tileObj.label]).forEach((obj) => {
+        if (obj) obj.setAlpha(alpha);
+      });
+      if (tileObj.ownerMarker) {
+        tileObj.ownerMarker.setAlpha(alpha);
       }
+
+      if (tileObj.highlight) {
+        tileObj.highlight.setVisible(Boolean(freeMove && isAllowed));
+      }
+
+      if (tileObj.startBonusBadge) {
+        const givesStartBonus = Boolean(
+          freeMove
+          && isAllowed
+          && doesClockwiseMovePassStart(actorPosition, tileObj.index)
+        );
+        tileObj.startBonusBadge.setVisible(givesStartBonus);
+      }
+
+      tileObj.rect.setStrokeStyle(
+        freeMove && isAllowed ? Math.max(3.5, this.tileSize * .06) : 1.3,
+        freeMove && isAllowed ? 0xffb300 : 0x14213d
+      );
     });
   }
 
@@ -1875,6 +2666,7 @@ async function leaveRoom() {
   roomState = null;
   roomCode = "";
   mySeat = null;
+  resetPlayerMoneyAnimations();
 
   els.setupPanel.classList.remove("hidden");
   els.gamePanel.classList.add("hidden");
@@ -1887,11 +2679,17 @@ els.createRoomBtn.addEventListener("click", createRoom);
 els.joinRoomBtn.addEventListener("click", joinRoom);
 els.startBtn.addEventListener("click", startGame);
 window.chooseFreeMoveTarget = chooseFreeMoveTarget;
+window.beginFreeMoveSelection = beginFreeMoveSelection;
+window.collectFreeParkingTax = collectFreeParkingTax;
 els.rollBtn.addEventListener("click", rollDice);
 els.copyRoomBtn.addEventListener("click", copyRoomCode);
 els.leaveBtn.addEventListener("click", leaveRoom);
-els.cardCloseBtn.addEventListener("click", hideCardPopupLocal);
+els.cardCloseBtn.addEventListener("click", closeCardAndFinishTurn);
 els.cardContinueBtn.addEventListener("click", closeCardAndFinishTurn);
+
+// Browser HP mengizinkan audio setelah interaksi pengguna pertama.
+document.addEventListener("pointerdown", unlockMoneyAudio, { passive: true });
+document.addEventListener("keydown", unlockMoneyAudio);
 
 window.addEventListener("beforeunload", () => {
   if (roomRef && mySeat !== null) {
