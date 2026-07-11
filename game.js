@@ -1,5 +1,7 @@
-const PLAYER_COLORS = ["#e53935", "#1e88e5", "#43a047", "#8e24aa"];
-const PLAYER_DEFAULTS = ["Pemain 1", "Pemain 2", "Pemain 3", "Pemain 4"];
+const PLAYER_COLORS = ["#e53935", "#1e88e5", "#43a047", "#8e24aa", "#607d8b", "#795548"];
+const PLAYER_DEFAULTS = ["Pemain 1", "Pemain 2", "Pemain 3", "Pemain 4", "Penonton 1", "Penonton 2"];
+const MAX_GAME_PLAYERS = 4;
+const MAX_ROOM_MEMBERS = 6;
 const BOARD_SIZE = 40;
 const START_MONEY = 1500;
 const PASS_START_BONUS = 200;
@@ -184,6 +186,10 @@ let presencePlayerRef = null;
 let presenceConnectionId = "";
 let hostElectionInProgress = false;
 let restoringRoomSession = false;
+let localDismissedOrderResultId = "";
+let lastPlayerOrderSignature = "";
+let orderRollInProgress = false;
+let orderRollFinalizeTimer = null;
 
 const ROOM_SESSION_KEY = "atho_room_session";
 
@@ -221,6 +227,11 @@ const els = {
   disconnectOverlay: document.getElementById("disconnectOverlay"),
   disconnectTitle: document.getElementById("disconnectTitle"),
   disconnectText: document.getElementById("disconnectText"),
+  orderOverlay: document.getElementById("orderOverlay"),
+  orderTitle: document.getElementById("orderTitle"),
+  orderText: document.getElementById("orderText"),
+  orderResults: document.getElementById("orderResults"),
+  orderRollBtn: document.getElementById("orderRollBtn"),
   cardOverlay: document.getElementById("cardOverlay"),
   cardPopup: document.getElementById("cardPopup"),
   cardDeckLabel: document.getElementById("cardDeckLabel"),
@@ -313,10 +324,35 @@ function isPlayerConnectedInState(stateLike, player) {
   return Boolean(player.connected);
 }
 
-function isPlayerGameParticipant(player, stateLike = roomState) {
-  if (!player || player.bankrupt) return false;
+function isSpectator(player) {
+  return player?.role === "spectator" || Number(player?.seat) >= MAX_GAME_PLAYERS;
+}
 
-  if (stateLike?.status === "playing" || stateLike?.status === "finished") {
+function isMonopolyPlayer(player) {
+  return Boolean(player) && !isSpectator(player) && Number(player.seat) < MAX_GAME_PLAYERS;
+}
+
+function normalizeSeatArray(value) {
+  if (Array.isArray(value)) return value.map(Number).filter(Number.isInteger);
+  if (value && typeof value === "object") return Object.values(value).map(Number).filter(Number.isInteger);
+  return [];
+}
+
+function getTurnOrderFromState(stateLike = roomState) {
+  const stored = normalizeSeatArray(stateLike?.turnOrder);
+  const valid = stored.filter(seat => isPlayerGameParticipant(stateLike?.players?.[seat], stateLike));
+  if (valid.length) return valid;
+
+  return Object.values(stateLike?.players || {})
+    .filter(player => isPlayerGameParticipant(player, stateLike))
+    .map(player => Number(player.seat))
+    .sort((a, b) => a - b);
+}
+
+function isPlayerGameParticipant(player, stateLike = roomState) {
+  if (!player || player.bankrupt || !isMonopolyPlayer(player)) return false;
+
+  if (["orderRoll", "playing", "finished"].includes(stateLike?.status)) {
     if (player.inGame === true) return true;
     if (player.inGame === false) return false;
     // Backward compatibility untuk room lama yang dibuat sebelum field inGame.
@@ -327,7 +363,7 @@ function isPlayerGameParticipant(player, stateLike = roomState) {
 }
 
 function getDisconnectedGamePlayers(stateLike = roomState) {
-  if (!stateLike || stateLike.status !== "playing") return [];
+  if (!stateLike || !["orderRoll", "playing"].includes(stateLike.status)) return [];
 
   return Object.values(stateLike.players || {})
     .filter(player => isPlayerGameParticipant(player, stateLike))
@@ -459,7 +495,7 @@ async function ensureLobbyHost(stateLike = roomState) {
   if (!roomRef || hostElectionInProgress || stateLike?.status !== "lobby") return;
 
   const connectedPlayers = Object.values(stateLike.players || {})
-    .filter(player => player?.id && isPlayerConnectedInState(stateLike, player))
+    .filter(player => player?.id && isMonopolyPlayer(player) && isPlayerConnectedInState(stateLike, player))
     .sort((a, b) => Number(a.seat) - Number(b.seat));
 
   if (!connectedPlayers.length) return;
@@ -480,7 +516,7 @@ async function ensureLobbyHost(stateLike = roomState) {
       if (!room || room.status !== "lobby") return room;
 
       const candidates = Object.values(room.players || {})
-        .filter(player => player?.id && isPlayerConnectedInState(room, player))
+        .filter(player => player?.id && isMonopolyPlayer(player) && isPlayerConnectedInState(room, player))
         .sort((a, b) => Number(a.seat) - Number(b.seat));
 
       if (!candidates.length) return room;
@@ -511,13 +547,14 @@ function makeInitialPropertyState() {
 
 function createInitialRoom(hostName) {
   const players = {};
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < MAX_ROOM_MEMBERS; i++) {
     players[i] = {
       seat: i,
+      role: i < MAX_GAME_PLAYERS ? "player" : "spectator",
       id: i === 0 ? myPlayerId : "",
       name: i === 0 ? hostName : PLAYER_DEFAULTS[i],
       color: PLAYER_COLORS[i],
-      money: START_MONEY,
+      money: i < MAX_GAME_PLAYERS ? START_MONEY : 0,
       position: 0,
       inJail: false,
       jailAttempts: 0,
@@ -543,6 +580,8 @@ function createInitialRoom(hostName) {
     lastMove: null,
     pendingAction: null,
     pendingExtraRoll: null,
+    turnOrder: [],
+    orderRoll: null,
     debtState: null,
     cardPopup: null,
     winnerSeat: null,
@@ -589,34 +628,37 @@ async function joinRoom() {
 
   const data = snap.val();
   const players = data.players || {};
-
   let seat = null;
 
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < MAX_ROOM_MEMBERS; i++) {
     if (players[i]?.id === myPlayerId) {
       seat = i;
       break;
     }
   }
 
+  const reconnectingExistingPlayer = seat !== null;
+
   if (seat === null) {
-    for (let i = 0; i < 4; i++) {
-      if (!players[i]?.id) {
-        seat = i;
-        break;
-      }
-    }
+    const gameAlreadyStarted = data.status !== "lobby";
+    const candidateSeats = gameAlreadyStarted
+      ? [4, 5]
+      : [0, 1, 2, 3, 4, 5];
+
+    seat = candidateSeats.find(index => !players[index]?.id) ?? null;
   }
 
   if (seat === null) {
-    alert("Room sudah penuh.");
+    alert("Room sudah penuh. Maksimal 4 pemain Monopoly dan 2 penonton.");
     return;
   }
 
-  mySeat = seat;
-
-  const reconnectingExistingPlayer = players[seat]?.id === myPlayerId;
+  mySeat = Number(seat);
+  const role = mySeat < MAX_GAME_PLAYERS ? "player" : "spectator";
   const playerUpdates = {
+    seat: mySeat,
+    role,
+    color: players[mySeat]?.color || PLAYER_COLORS[mySeat],
     id: myPlayerId,
     name: playerName,
     connected: true,
@@ -626,14 +668,22 @@ async function joinRoom() {
   if (!reconnectingExistingPlayer) {
     playerUpdates.inGame = false;
     playerUpdates.bankrupt = false;
+    playerUpdates.money = role === "player" ? START_MONEY : 0;
+    playerUpdates.position = 0;
+    playerUpdates.inJail = false;
+    playerUpdates.jailAttempts = 0;
+    playerUpdates.roulette12Streak = 0;
+    playerUpdates.lapsCompleted = 0;
+    playerUpdates.isHost = false;
   }
 
-  await roomRef.child(`players/${seat}`).update(playerUpdates);
+  await roomRef.child(`players/${mySeat}`).update(playerUpdates);
   await setupCurrentPresence();
   saveRoomSession(playerName);
 
   if (!reconnectingExistingPlayer) {
-    await addRemoteLog(`${playerName} bergabung sebagai Pemain ${seat + 1}.`);
+    const roleLabel = role === "spectator" ? `Penonton ${mySeat - 3}` : `Pemain ${mySeat + 1}`;
+    await addRemoteLog(`${playerName} bergabung sebagai ${roleLabel}.`);
   }
 
   enterGameView();
@@ -678,6 +728,7 @@ function subscribeRoom() {
     }
 
     maybeAnimateLastMove();
+    scheduleStartingOrderFinalization(roomState);
   });
 }
 
@@ -722,6 +773,8 @@ function isImportantGameLog(text) {
     "bebas dari penjara",
     "roulette penjara",
     "roulette 12",
+    "penentuan giliran",
+    "urutan pertama",
     "bergabung",
     "keluar dari game",
     "keluar dari room",
@@ -776,21 +829,18 @@ function isPlayerBoardActive(player) {
 function getConnectedSeatsFromState(stateLike = roomState) {
   if (!stateLike?.players) return [];
   return Object.values(stateLike.players)
-    .filter(player => player?.id && !player.bankrupt && isPlayerConnectedInState(stateLike, player))
+    .filter(player => player?.id && isMonopolyPlayer(player) && !player.bankrupt && isPlayerConnectedInState(stateLike, player))
     .map(player => Number(player.seat))
     .sort((a, b) => a - b);
 }
 
 function getActiveSeatsFromState(stateLike = roomState) {
   if (!stateLike?.players) return [];
-  return Object.values(stateLike.players)
-    .filter(player => isPlayerGameParticipant(player, stateLike))
-    .map(player => Number(player.seat))
-    .sort((a, b) => a - b);
+  return getTurnOrderFromState(stateLike);
 }
 
 function getActiveSeats() {
-  return roomState?.status === "playing"
+  return ["orderRoll", "playing"].includes(roomState?.status)
     ? getActiveSeatsFromState(roomState)
     : getConnectedSeatsFromState(roomState);
 }
@@ -806,7 +856,7 @@ function getNextActiveSeat(currentSeat) {
 }
 
 function canIStart() {
-  return roomState?.players?.[mySeat]?.isHost && roomState.status === "lobby";
+  return roomState?.players?.[mySeat]?.isHost && isMonopolyPlayer(roomState?.players?.[mySeat]) && roomState.status === "lobby";
 }
 
 function canIRoll() {
@@ -871,30 +921,219 @@ function canIResolveDebt() {
 async function startGame() {
   if (!canIStart()) return;
 
-  const activeSeats = getConnectedSeatsFromState(roomState);
+  const activeSeats = getConnectedSeatsFromState(roomState).slice(0, MAX_GAME_PLAYERS);
   if (activeSeats.length < 2) {
-    alert("Minimal 2 pemain aktif untuk mulai game.");
+    alert("Minimal 2 pemain Monopoly aktif untuk mulai game.");
     return;
   }
 
   const updates = {
-    status: "playing",
+    status: "orderRoll",
     currentSeat: activeSeats[0],
     isRolling: false,
     pendingAction: null,
     pendingExtraRoll: null,
     debtState: null,
-    winnerSeat: null
+    cardPopup: null,
+    winnerSeat: null,
+    turnOrder: [],
+    orderRoll: {
+      id: `${Date.now()}_starting_order_${Math.random().toString(16).slice(2)}`,
+      eligibleSeats: activeSeats,
+      queue: activeSeats,
+      currentIndex: 0,
+      histories: {},
+      round: 1,
+      completed: false,
+      createdAt: Date.now()
+    }
   };
 
   Object.values(roomState.players || {}).forEach((player) => {
-    updates[`players/${player.seat}/inGame`] = activeSeats.includes(Number(player.seat));
+    const participant = activeSeats.includes(Number(player.seat)) && isMonopolyPlayer(player);
+    updates[`players/${player.seat}/inGame`] = participant;
     updates[`players/${player.seat}/roulette12Streak`] = 0;
+    if (isSpectator(player)) updates[`players/${player.seat}/money`] = 0;
   });
 
   await roomRef.update(updates);
+  await addRemoteLog("Game dimulai. Pemain menentukan urutan giliran melalui roulette.");
+}
 
-  await addRemoteLog("Game dimulai.");
+function compareRollHistories(a = [], b = []) {
+  const maxLength = Math.max(a.length, b.length);
+  for (let index = 0; index < maxLength; index++) {
+    const av = Number(a[index] ?? -1);
+    const bv = Number(b[index] ?? -1);
+    if (av !== bv) return bv - av;
+  }
+  return 0;
+}
+
+function getStartingOrderRanking(stateLike = roomState) {
+  const eligible = normalizeSeatArray(stateLike?.orderRoll?.eligibleSeats);
+  const histories = stateLike?.orderRoll?.histories || {};
+  return eligible.sort((seatA, seatB) => {
+    const comparison = compareRollHistories(histories[seatA] || [], histories[seatB] || []);
+    return comparison || seatA - seatB;
+  });
+}
+
+function findStartingOrderTies(stateLike) {
+  const eligible = normalizeSeatArray(stateLike?.orderRoll?.eligibleSeats);
+  const histories = stateLike?.orderRoll?.histories || {};
+  const groups = new Map();
+
+  eligible.forEach(seat => {
+    const key = JSON.stringify(normalizeSeatArray(histories[seat]));
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(seat);
+  });
+
+  return [...groups.values()].filter(group => group.length > 1);
+}
+
+async function rollStartingOrder() {
+  if (!roomRef || orderRollInProgress || roomState?.status !== "orderRoll") return;
+
+  const latest = (await roomRef.once("value")).val();
+  const order = latest?.orderRoll;
+  const queue = normalizeSeatArray(order?.queue);
+  const currentIndex = Number(order?.currentIndex || 0);
+  const seat = queue[currentIndex];
+
+  if (!latest || order?.completed || seat === undefined || Number(seat) !== Number(mySeat)) return;
+  if (latest.isRolling || isGamePausedForDisconnect(latest)) return;
+
+  orderRollInProgress = true;
+  const result = Math.floor(Math.random() * 12) + 1;
+  const rollId = `${Date.now()}_${seat}_order_roll_${Math.random().toString(16).slice(2)}`;
+  const rotation = getRouletteFinalRotation(Number(latest.lastRoulette?.rotation || 0), result);
+  const histories = { ...(order.histories || {}) };
+  const previousHistory = normalizeSeatArray(histories[seat]);
+  histories[seat] = [...previousHistory, result];
+
+  try {
+    await roomRef.update({
+      isRolling: true,
+      lastDice: [0, result],
+      lastRoulette: {
+        id: rollId,
+        result,
+        rotation,
+        source: "starting-order",
+        createdAt: Date.now()
+      },
+      [`orderRoll/histories/${seat}`]: histories[seat]
+    });
+    orderRollInProgress = false;
+    scheduleStartingOrderFinalization({
+      ...latest,
+      isRolling: true,
+      lastRoulette: { id: rollId, source: "starting-order", createdAt: Date.now() }
+    });
+  } catch (error) {
+    orderRollInProgress = false;
+    console.error("Gagal memproses roulette penentuan giliran.", error);
+    await roomRef.update({ isRolling: false });
+  }
+}
+
+function scheduleStartingOrderFinalization(stateLike = roomState) {
+  if (orderRollFinalizeTimer) {
+    clearTimeout(orderRollFinalizeTimer);
+    orderRollFinalizeTimer = null;
+  }
+
+  const roulette = stateLike?.lastRoulette;
+  if (stateLike?.status !== "orderRoll"
+    || !stateLike?.isRolling
+    || roulette?.source !== "starting-order"
+    || !roulette?.id) return;
+
+  const elapsed = Date.now() - Number(roulette.createdAt || Date.now());
+  const delay = Math.max(80, 1800 - elapsed);
+  orderRollFinalizeTimer = setTimeout(() => {
+    orderRollFinalizeTimer = null;
+    finalizeStartingOrderRoll(roulette.id).catch(error => {
+      console.error("Gagal menyelesaikan roulette penentuan giliran.", error);
+    });
+  }, delay);
+}
+
+async function finalizeStartingOrderRoll(rollId) {
+  if (!roomRef || !rollId) return;
+
+  const transaction = await roomRef.transaction((room) => {
+    if (!room
+      || room.status !== "orderRoll"
+      || !room.isRolling
+      || room.lastRoulette?.source !== "starting-order"
+      || room.lastRoulette?.id !== rollId
+      || room.orderRoll?.lastProcessedRollId === rollId) {
+      return;
+    }
+
+    const order = room.orderRoll || {};
+    const queue = normalizeSeatArray(order.queue);
+    const nextIndex = Number(order.currentIndex || 0) + 1;
+    order.lastProcessedRollId = rollId;
+
+    if (nextIndex < queue.length) {
+      const nextSeat = queue[nextIndex];
+      order.currentIndex = nextIndex;
+      order.lastOutcome = { type: "next", rollId, nextSeat };
+      room.currentSeat = nextSeat;
+      room.isRolling = false;
+      room.orderRoll = order;
+      return room;
+    }
+
+    const stateForRanking = { ...room, orderRoll: order };
+    const ties = findStartingOrderTies(stateForRanking);
+    if (ties.length) {
+      const tieQueue = ties.flat().sort((a, b) => a - b);
+      order.queue = tieQueue;
+      order.currentIndex = 0;
+      order.round = Number(order.round || 1) + 1;
+      order.lastOutcome = { type: "tie", rollId, tieQueue };
+      room.currentSeat = tieQueue[0];
+      room.isRolling = false;
+      room.orderRoll = order;
+      return room;
+    }
+
+    const finalOrder = getStartingOrderRanking(stateForRanking);
+    const winnerSeat = finalOrder[0];
+    order.completed = true;
+    order.finalOrder = finalOrder;
+    order.resultId = `${rollId}_result`;
+    order.completedAt = Date.now();
+    order.lastOutcome = { type: "completed", rollId, winnerSeat };
+
+    room.status = "playing";
+    room.isRolling = false;
+    room.currentSeat = winnerSeat;
+    room.turnOrder = finalOrder;
+    room.orderRoll = order;
+    return room;
+  });
+
+  if (!transaction.committed) return;
+  const updated = transaction.snapshot.val();
+  const outcome = updated?.orderRoll?.lastOutcome;
+  if (outcome?.rollId !== rollId) return;
+
+  if (outcome.type === "tie") {
+    const names = normalizeSeatArray(outcome.tieQueue)
+      .map(seat => updated.players?.[seat]?.name)
+      .filter(Boolean);
+    await addRemoteLog(`Nilai roulette penentuan giliran seri. ${names.join(", ")} melakukan roulette ulang.`);
+  } else if (outcome.type === "completed") {
+    const winnerSeat = Number(outcome.winnerSeat);
+    const winnerName = updated.players?.[winnerSeat]?.name || `Pemain ${winnerSeat + 1}`;
+    await addRemoteLog(`${winnerName} memperoleh urutan pertama dari roulette penentuan giliran.`);
+  }
 }
 
 function normalizeRouletteAngle(angle) {
@@ -2068,7 +2307,7 @@ function renderUI() {
   const current = players[roomState.currentSeat];
   const me = players[mySeat];
 
-  els.turnName.textContent = current?.name || "-";
+  els.turnName.textContent = roomState.status === "orderRoll" ? (current?.name || "-") : (current?.name || "-");
   renderRouletteUI();
 
   els.startBtn.disabled = !canIStart();
@@ -2078,9 +2317,21 @@ function renderUI() {
     const winner = players[roomState.winnerSeat];
     els.statusText.textContent = `Game selesai. Pemenang: ${winner?.name || "Pemain terakhir"}.`;
   } else if (roomState.status === "lobby") {
-    els.statusText.textContent = canIStart()
-      ? "Kamu host. Setelah minimal 2 pemain masuk, klik Mulai Game."
-      : "Menunggu host memulai game.";
+    if (isSpectator(me)) {
+      els.statusText.textContent = "Kamu bergabung sebagai penonton. Kamu dapat menyaksikan permainan tanpa mendapat giliran.";
+    } else {
+      els.statusText.textContent = canIStart()
+        ? "Kamu host. Setelah minimal 2 pemain masuk, klik Mulai Game."
+        : "Menunggu host memulai game.";
+    }
+  } else if (roomState.status === "orderRoll") {
+    els.statusText.textContent = isSpectator(me)
+      ? `Menonton ${current?.name || "pemain"} menentukan urutan giliran.`
+      : Number(roomState.currentSeat) === Number(mySeat)
+        ? "Giliranmu memutar roulette untuk menentukan urutan permainan."
+        : `Menunggu ${current?.name || "pemain"} menentukan urutan giliran.`;
+  } else if (isSpectator(me)) {
+    els.statusText.textContent = "Kamu adalah penonton. Permainan tetap dapat disaksikan secara realtime.";
   } else if (me?.bankrupt) {
     els.statusText.textContent = "Kamu sudah bangkrut dan sekarang menjadi penonton. Permainan pemain lain tetap berlanjut.";
   } else if (roomState.isRolling) {
@@ -2128,6 +2379,81 @@ function renderUI() {
   renderLogs();
   renderCardPopup();
   renderDisconnectOverlay();
+  renderOrderOverlay();
+}
+
+
+function formatOrderHistory(history) {
+  const values = normalizeSeatArray(history);
+  return values.length ? values.join(" → ") : "Belum roulette";
+}
+
+function renderOrderOverlay() {
+  if (!els.orderOverlay) return;
+
+  const order = roomState?.orderRoll;
+  const resultId = order?.resultId || "";
+  const showRolling = roomState?.status === "orderRoll" && order && !order.completed;
+  const showResult = roomState?.status === "playing"
+    && order?.completed
+    && resultId
+    && resultId !== localDismissedOrderResultId;
+  const shouldShow = showRolling || showResult;
+
+  els.orderOverlay.classList.toggle("hidden", !shouldShow);
+  els.orderOverlay.setAttribute("aria-hidden", shouldShow ? "false" : "true");
+  if (!shouldShow) return;
+
+  const histories = order?.histories || {};
+  const ranking = showResult
+    ? normalizeSeatArray(order.finalOrder)
+    : getStartingOrderRanking(roomState);
+
+  if (showResult) {
+    els.orderTitle.textContent = "Urutan Giliran Ditentukan";
+    els.orderText.textContent = "Urutan pemain telah disusun dari hasil roulette tertinggi.";
+    els.orderResults.innerHTML = ranking.map((seat, index) => {
+      const player = roomState.players?.[seat];
+      return `<div class="order-result-row final"><span>${index + 1}</span><strong>${escapeHTML(player?.name || `Pemain ${seat + 1}`)}</strong><em>${escapeHTML(formatOrderHistory(histories[seat]))}</em></div>`;
+    }).join("");
+    els.orderRollBtn.textContent = "Lanjutkan ke Permainan";
+    els.orderRollBtn.disabled = false;
+    els.orderRollBtn.dataset.mode = "dismiss";
+    return;
+  }
+
+  const queue = normalizeSeatArray(order.queue);
+  const currentIndex = Number(order.currentIndex || 0);
+  const currentSeat = queue[currentIndex];
+  const currentPlayer = roomState.players?.[currentSeat];
+  const isMyTurn = Number(currentSeat) === Number(mySeat) && !isSpectator(roomState.players?.[mySeat]);
+  const isTieRound = Number(order.round || 1) > 1;
+
+  els.orderTitle.textContent = isTieRound ? "Roulette Ulang Karena Seri" : "Penentuan Giliran";
+  els.orderText.textContent = isMyTurn
+    ? `Giliran ${currentPlayer?.name || "kamu"} untuk menentukan urutan dari nilai roulette.`
+    : `Menunggu ${currentPlayer?.name || "pemain"} memutar roulette penentuan giliran.`;
+  els.orderResults.innerHTML = ranking.map((seat, index) => {
+    const player = roomState.players?.[seat];
+    return `<div class="order-result-row"><span>${index + 1}</span><strong>${escapeHTML(player?.name || `Pemain ${seat + 1}`)}</strong><em>${escapeHTML(formatOrderHistory(histories[seat]))}</em></div>`;
+  }).join("");
+  els.orderRollBtn.textContent = roomState.isRolling
+    ? "Roulette Berputar..."
+    : isMyTurn ? "Putar Roulette Penentuan" : `Menunggu ${currentPlayer?.name || "Pemain"}`;
+  els.orderRollBtn.disabled = !isMyTurn || roomState.isRolling || isGamePausedForDisconnect(roomState);
+  els.orderRollBtn.dataset.mode = "roll";
+}
+
+function handleOrderOverlayButton() {
+  if (els.orderRollBtn?.dataset.mode === "dismiss") {
+    localDismissedOrderResultId = roomState?.orderRoll?.resultId || "";
+    renderOrderOverlay();
+    renderPlayersList(roomState?.players || {});
+    if (gameScene && roomState) gameScene.renderRoomState(roomState);
+    return;
+  }
+
+  rollStartingOrder();
 }
 
 
@@ -2135,7 +2461,7 @@ function renderDisconnectOverlay() {
   if (!els.disconnectOverlay) return;
 
   const disconnectedPlayers = getDisconnectedGamePlayers(roomState);
-  const shouldShow = roomState?.status === "playing" && disconnectedPlayers.length > 0;
+  const shouldShow = ["orderRoll", "playing"].includes(roomState?.status) && disconnectedPlayers.length > 0;
 
   els.disconnectOverlay.classList.toggle("hidden", !shouldShow);
   els.disconnectOverlay.setAttribute("aria-hidden", shouldShow ? "false" : "true");
@@ -2173,9 +2499,32 @@ function renderActionPanel() {
   }
 
   if (roomState.status === "lobby") {
+    const me = roomState.players?.[mySeat];
+    els.actionPanel.innerHTML = isSpectator(me)
+      ? `
+        <div class="action-title">Mode Penonton</div>
+        <div class="action-sub">Slot pemain Monopoly sudah penuh. Kamu dapat menyaksikan seluruh permainan secara realtime.</div>
+      `
+      : `
+        <div class="action-title">Lobby</div>
+        <div class="action-sub">Menunggu pemain masuk. Host dapat memulai game setelah minimal 2 pemain aktif.</div>
+      `;
+    return;
+  }
+
+  if (roomState.status === "orderRoll") {
+    const currentOrderPlayer = roomState.players?.[roomState.currentSeat];
     els.actionPanel.innerHTML = `
-      <div class="action-title">Lobby</div>
-      <div class="action-sub">Menunggu pemain masuk. Host dapat memulai game setelah minimal 2 pemain aktif.</div>
+      <div class="action-title">PENENTUAN GILIRAN</div>
+      <div class="action-sub">${escapeHTML(currentOrderPlayer?.name || "Pemain")} sedang menentukan urutan melalui roulette. Nilai terbesar mendapat giliran lebih awal.</div>
+    `;
+    return;
+  }
+
+  if (isSpectator(roomState.players?.[mySeat])) {
+    els.actionPanel.innerHTML = `
+      <div class="action-title">Mode Penonton</div>
+      <div class="action-sub">Kamu dapat melihat papan, transaksi, dan riwayat, tetapi tidak dapat melakukan aksi permainan.</div>
     `;
     return;
   }
@@ -2595,17 +2944,78 @@ function createPlayerRow(seat) {
   return row;
 }
 
+function shouldApplyTurnOrderLocally() {
+  const resultId = roomState?.orderRoll?.resultId || "";
+  if (roomState?.status === "playing" && resultId && resultId !== localDismissedOrderResultId) {
+    return false;
+  }
+  return true;
+}
+
+function getVisiblePlayerSortKey(player) {
+  const seat = Number(player.seat);
+  if (isSpectator(player)) return 100 + seat;
+  if (player?.bankrupt) return 50 + seat;
+
+  if (["playing", "finished"].includes(roomState?.status) && shouldApplyTurnOrderLocally()) {
+    const order = getTurnOrderFromState(roomState);
+    const index = order.indexOf(seat);
+    if (index !== -1) return index;
+  }
+
+  return seat;
+}
+
+function getPlayerDisplayNumber(player) {
+  const seat = Number(player.seat);
+  if (isSpectator(player)) return `S${Math.max(1, seat - MAX_GAME_PLAYERS + 1)}`;
+
+  if (["playing", "finished"].includes(roomState?.status) && shouldApplyTurnOrderLocally()) {
+    const index = getTurnOrderFromState(roomState).indexOf(seat);
+    if (index !== -1) return String(index + 1);
+  }
+
+  return String(seat + 1);
+}
+
+function animatePlayerListReorder(previousRects) {
+  requestAnimationFrame(() => {
+    els.playersList.querySelectorAll(".player-row[data-seat]").forEach(row => {
+      const oldRect = previousRects.get(row.dataset.seat);
+      if (!oldRect) return;
+      const newRect = row.getBoundingClientRect();
+      const deltaY = oldRect.top - newRect.top;
+      if (Math.abs(deltaY) < 1) return;
+
+      row.style.transition = "none";
+      row.style.transform = `translateY(${deltaY}px)`;
+      row.style.zIndex = "3";
+      requestAnimationFrame(() => {
+        row.style.transition = "transform 620ms cubic-bezier(.2,.8,.2,1)";
+        row.style.transform = "translateY(0)";
+        row.addEventListener("transitionend", () => {
+          row.style.transition = "";
+          row.style.transform = "";
+          row.style.zIndex = "";
+        }, { once: true });
+      });
+    });
+  });
+}
+
 function renderPlayersList(players) {
   const visiblePlayers = Object.values(players)
     .filter(player => player?.id || player.bankrupt || isPlayerConnectedInState(roomState, player))
-    .sort((a, b) => Number(a.seat) - Number(b.seat));
+    .sort((a, b) => getVisiblePlayerSortKey(a) - getVisiblePlayerSortKey(b));
   const visibleSeats = new Set(visiblePlayers.map(player => Number(player.seat)));
-
+  const previousRects = new Map();
   els.playersList.querySelectorAll(".player-row[data-seat]").forEach(row => {
-    if (!visibleSeats.has(Number(row.dataset.seat))) {
-      row.remove();
-    }
+    previousRects.set(row.dataset.seat, row.getBoundingClientRect());
+    if (!visibleSeats.has(Number(row.dataset.seat))) row.remove();
   });
+
+  const orderSignature = visiblePlayers.map(player => Number(player.seat)).join("-");
+  const shouldAnimateOrder = lastPlayerOrderSignature && lastPlayerOrderSignature !== orderSignature;
 
   visiblePlayers.forEach((player, playerIndex) => {
     const seat = Number(player.seat);
@@ -2616,16 +3026,14 @@ function renderPlayersList(players) {
       els.playersList.appendChild(row);
     }
 
-    // Jangan append ulang row pada setiap snapshot Firebase. Memindahkan node
-    // yang sama dapat me-restart CSS animation dan membuat seluruh Data Pemain
-    // tampak berkedip ketika pion sedang berjalan.
     const rowAtExpectedPosition = els.playersList.children[playerIndex];
     if (rowAtExpectedPosition !== row) {
       els.playersList.insertBefore(row, rowAtExpectedPosition || null);
     }
 
-    const ownedIds = getOwnedPropertyIds(player.seat);
-    const ownedTags = ownedIds.slice(0, 6).map(id => {
+    const spectator = isSpectator(player);
+    const ownedIds = spectator ? [] : getOwnedPropertyIds(player.seat);
+    const ownedTags = spectator ? "" : ownedIds.slice(0, 6).map(id => {
       const property = PROPERTY_DATA[id];
       const ps = getPropertyState(id);
       const level = property.kind === "city" ? ` ${RENT_LABELS[Number(ps.level || 0)]}` : "";
@@ -2633,34 +3041,53 @@ function renderPlayersList(players) {
     }).join("");
 
     const playerConnected = isPlayerConnectedInState(roomState, player);
-    row.classList.toggle("active", seat === Number(roomState.currentSeat) && !player.bankrupt);
+    row.classList.toggle("active", !spectator && seat === Number(roomState.currentSeat) && !player.bankrupt);
     row.classList.toggle("bankrupt", Boolean(player.bankrupt));
     row.classList.toggle("disconnected", !playerConnected && !player.bankrupt);
+    row.classList.toggle("spectator", spectator);
 
     const dot = row.querySelector('[data-role="dot"]');
     const name = row.querySelector('[data-role="name"]');
     const sub = row.querySelector('[data-role="sub"]');
     const owned = row.querySelector('[data-role="owned"]');
+    const money = row.querySelector('[data-role="money"]');
+    const moneyChange = row.querySelector('[data-role="money-change"]');
 
-    dot.style.background = player.color;
-    dot.textContent = String(seat + 1);
-    name.textContent = player.bankrupt ? `${player.name} • BANGKRUT` : player.name;
+    dot.style.background = player.color || (spectator ? "#607d8b" : PLAYER_COLORS[seat]);
+    dot.textContent = getPlayerDisplayNumber(player);
+    name.textContent = player.bankrupt
+      ? `${player.name} • BANGKRUT`
+      : spectator ? `${player.name} • PENONTON` : player.name;
 
-    if (player.bankrupt) {
+    if (spectator) {
+      sub.textContent = playerConnected ? "Online • Menyaksikan permainan" : "Offline • Penonton";
+      owned.innerHTML = '<span class="owned-tag spectator-tag">Tidak masuk giliran</span>';
+      playerMoneyAnimationStates.delete(seat);
+      money.textContent = "MENONTON";
+      moneyChange.textContent = "";
+      money.classList.remove("money-value-pop");
+    } else if (player.bankrupt) {
       sub.textContent = `Penonton • Tanah ${ownedIds.length}`;
       owned.innerHTML = `<span class="owned-tag bankrupt-tag">BANGKRUT — hanya menonton</span>`;
+      const moneyState = queuePlayerMoneyChange(seat, player.money);
+      setDisplayedPlayerMoney(seat, moneyState.displayed);
     } else {
       const activationText = isPlayerBoardActive(player)
         ? `Aktif • Putaran ${Number(player.lapsCompleted || 0)}`
         : "Belum aktif • Putaran 0/1";
       const connectionText = playerConnected ? "Online" : "Offline — menunggu kembali";
-      sub.textContent = `Petak ${player.position || 0} • ${connectionText} • ${activationText} • Tanah ${ownedIds.length}${player.inJail ? ` • Penjara ${Number(player.jailAttempts || 0)}/3` : ""}`;
+      const orderIndex = getTurnOrderFromState(roomState).indexOf(seat);
+      const orderText = ["playing", "finished"].includes(roomState?.status) && shouldApplyTurnOrderLocally() && orderIndex !== -1
+        ? ` • Urutan ${orderIndex + 1}` : "";
+      sub.textContent = `Petak ${player.position || 0} • ${connectionText}${orderText} • ${activationText} • Tanah ${ownedIds.length}${player.inJail ? ` • Penjara ${Number(player.jailAttempts || 0)}/3` : ""}`;
       owned.innerHTML = ownedTags || `<span class="owned-tag">Belum punya tanah</span>`;
+      const moneyState = queuePlayerMoneyChange(seat, player.money);
+      setDisplayedPlayerMoney(seat, moneyState.displayed);
     }
-
-    const moneyState = queuePlayerMoneyChange(seat, player.money);
-    setDisplayedPlayerMoney(seat, moneyState.displayed);
   });
+
+  if (shouldAnimateOrder) animatePlayerListReorder(previousRects);
+  lastPlayerOrderSignature = orderSignature;
 }
 
 function renderLogs() {
@@ -3373,19 +3800,21 @@ class BoardScene extends Phaser.Scene {
     Object.entries(this.pawns).forEach(([seat, pawn]) => {
       const player = state.players?.[seat];
       const shouldShow = state.status === "lobby"
-        ? Boolean(player && isPlayerConnectedInState(state, player) && !player.bankrupt)
+        ? Boolean(player && isMonopolyPlayer(player) && isPlayerConnectedInState(state, player) && !player.bankrupt)
         : Boolean(player && isPlayerGameParticipant(player, state) && !player.bankrupt);
       pawn.setVisible(shouldShow);
     });
 
     Object.values(state.players || {})
       .filter(player => state.status === "lobby"
-        ? isPlayerConnectedInState(state, player) && !player.bankrupt
+        ? isMonopolyPlayer(player) && isPlayerConnectedInState(state, player) && !player.bankrupt
         : isPlayerGameParticipant(player, state) && !player.bankrupt)
       .forEach(player => {
         const seat = Number(player.seat);
         const position = Number(player.position || 0);
         this.ensurePawn(player);
+        const pawnNumberText = this.pawns[seat]?.getAt?.(1);
+        if (pawnNumberText?.setText) pawnNumberText.setText(getPlayerDisplayNumber(player));
         this.pawns[seat].setVisible(true);
         this.pawns[seat].setAlpha(isPlayerConnectedInState(state, player) ? 1 : 0.55);
         if (!this.animatingSeats.has(seat)) {
@@ -3405,7 +3834,8 @@ class BoardScene extends Phaser.Scene {
     const circle = this.add.circle(0, 0, Math.max(9, this.tileSize * .16), Phaser.Display.Color.HexStringToColor(player.color).color);
     circle.setStrokeStyle(2, 0xffffff);
 
-    const text = this.add.text(0, 0, String(seat + 1), {
+    const pawnNumber = getPlayerDisplayNumber(player);
+    const text = this.add.text(0, 0, pawnNumber, {
       fontFamily: "Arial",
       fontSize: `${Math.max(9, Math.floor(this.tileSize * .18))}px`,
       fontStyle: "bold",
@@ -3751,6 +4181,9 @@ async function leaveRoom() {
   updates[`players/${mySeat}/disconnectedAt`] = firebase.database.ServerValue.TIMESTAMP;
   updates[`players/${mySeat}/roulette12Streak`] = 0;
   updates[`presence/${mySeat}`] = null;
+  if (normalizeSeatArray(latest?.turnOrder).includes(Number(mySeat))) {
+    updates.turnOrder = normalizeSeatArray(latest.turnOrder).filter(seat => seat !== Number(mySeat));
+  }
 
   if (latest?.pendingExtraRoll && Number(latest.pendingExtraRoll.seat) === Number(mySeat)) {
     updates.pendingExtraRoll = null;
@@ -3761,7 +4194,7 @@ async function leaveRoom() {
   if (latest?.status === "lobby") {
     const remainingConnectedPlayers = Object.values(latest.players || {})
       .filter(player => Number(player.seat) !== Number(mySeat))
-      .filter(player => player?.id && isPlayerConnectedInState(latest, player))
+      .filter(player => player?.id && isMonopolyPlayer(player) && isPlayerConnectedInState(latest, player))
       .sort((a, b) => Number(a.seat) - Number(b.seat));
 
     const newHostSeat = remainingConnectedPlayers.length
@@ -3776,6 +4209,42 @@ async function leaveRoom() {
 
     if (newHostSeat !== null) {
       newHostName = latest.players?.[newHostSeat]?.name || `Pemain ${newHostSeat + 1}`;
+    }
+  } else if (latest?.status === "orderRoll" && isPlayerGameParticipant(leavingPlayer, latest)) {
+    const remainingConnected = remainingParticipants.filter(seat => isPlayerConnectedInState(latest, latest.players?.[seat]));
+    const existingHostSeat = Number(latest.hostSeat);
+    const newHostSeat = remainingConnected.includes(existingHostSeat)
+      ? existingHostSeat
+      : (remainingConnected[0] ?? null);
+    updates.hostSeat = newHostSeat;
+    Object.values(latest.players || {}).forEach(player => {
+      updates[`players/${player.seat}/isHost`] = newHostSeat !== null && Number(player.seat) === Number(newHostSeat);
+    });
+    updates.isRolling = false;
+    updates.pendingAction = null;
+    updates.pendingExtraRoll = null;
+
+    if (remainingConnected.length < 2) {
+      updates.status = "lobby";
+      updates.orderRoll = null;
+      updates.turnOrder = [];
+      updates.currentSeat = remainingConnected[0] ?? 0;
+      remainingConnected.forEach(seat => { updates[`players/${seat}/inGame`] = false; });
+    } else {
+      updates.status = "lobby";
+      updates.orderRoll = null;
+      updates.turnOrder = [];
+      updates.currentSeat = remainingConnected[0];
+      remainingConnected.forEach(seat => { updates[`players/${seat}/inGame`] = false; });
+      updates.cardPopup = {
+        id: `${Date.now()}_order_cancelled_leave`,
+        deckType: "system",
+        deck: "Penentuan Giliran",
+        title: "Penentuan Giliran Dibatalkan",
+        text: `${leavingPlayer?.name || "Seorang pemain"} keluar. Host dapat memulai kembali penentuan giliran.`,
+        seat: remainingConnected[0],
+        playerName: latest.players?.[remainingConnected[0]]?.name || "Host"
+      };
     }
   } else if (latest?.status === "playing" && isPlayerGameParticipant(leavingPlayer, latest)) {
     if (remainingParticipants.length <= 1) {
@@ -3802,8 +4271,12 @@ async function leaveRoom() {
       };
     } else {
       if (Number(latest.currentSeat) === Number(mySeat)) {
-        const sorted = [...remainingParticipants].sort((a, b) => a - b);
-        const nextSeat = sorted.find(seat => seat > Number(mySeat)) ?? sorted[0];
+        const originalOrder = getTurnOrderFromState(latest);
+        const currentOrder = originalOrder.filter(seat => seat !== Number(mySeat));
+        const leavingIndex = originalOrder.indexOf(Number(mySeat));
+        const nextSeat = currentOrder.length
+          ? currentOrder[((leavingIndex >= 0 ? leavingIndex : 0) % currentOrder.length)]
+          : null;
         updates.currentSeat = nextSeat;
       }
 
@@ -3856,6 +4329,7 @@ async function leaveRoom() {
 els.createRoomBtn.addEventListener("click", createRoom);
 els.joinRoomBtn.addEventListener("click", joinRoom);
 els.startBtn.addEventListener("click", startGame);
+els.orderRollBtn?.addEventListener("click", handleOrderOverlayButton);
 window.chooseFreeMoveTarget = chooseFreeMoveTarget;
 window.acceptRoulette12Bonus = acceptRoulette12Bonus;
 window.beginFreeMoveSelection = beginFreeMoveSelection;

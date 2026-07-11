@@ -2277,3 +2277,181 @@ body.history-open {
     font-size: 12px;
   }
 }
+
+/* V17: penentuan urutan awal dan maksimal 2 penonton. */
+.order-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 13000;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(15, 27, 46, .78);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.order-modal {
+  width: min(460px, calc(100vw - 30px));
+  max-height: min(720px, calc(100dvh - 28px));
+  overflow-y: auto;
+  border: 3px solid var(--gold);
+  border-radius: 26px;
+  padding: 24px;
+  color: var(--navy);
+  background: linear-gradient(180deg, #fffaf0, #f8e4af);
+  box-shadow: 0 26px 70px rgba(0, 0, 0, .42);
+  text-align: center;
+  animation: orderModalIn .24s ease-out;
+}
+
+.order-kicker {
+  color: var(--green);
+  font-size: 11px;
+  font-weight: 1000;
+  letter-spacing: 1px;
+}
+
+.order-modal h2 {
+  margin: 5px 0 8px;
+  font-size: 27px;
+}
+
+.order-modal > p {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.45;
+}
+
+.order-results {
+  display: grid;
+  gap: 7px;
+  margin: 12px 0 16px;
+}
+
+.order-result-row {
+  display: grid;
+  grid-template-columns: 30px 1fr auto;
+  gap: 8px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid #dfc58d;
+  border-radius: 13px;
+  background: rgba(255, 250, 240, .88);
+  text-align: left;
+}
+
+.order-result-row.final {
+  border-color: rgba(15, 107, 79, .45);
+  background: #eaf7ee;
+}
+
+.order-result-row span {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: var(--green);
+  font-size: 12px;
+  font-weight: 1000;
+}
+
+.order-result-row strong {
+  min-width: 0;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.order-result-row em {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.order-roll-btn {
+  width: 100%;
+  min-height: 44px;
+}
+
+.order-note {
+  margin-top: 11px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.player-row {
+  will-change: transform;
+}
+
+.player-row.spectator {
+  background: #eef2f4;
+  border-style: dashed;
+  border-color: #9aa7ad;
+}
+
+.player-row.spectator .player-dot {
+  font-size: 9px;
+}
+
+.player-row.spectator .money {
+  color: #607d8b;
+  font-size: 10px;
+  letter-spacing: .3px;
+}
+
+.spectator-tag {
+  color: #455a64;
+  background: #dfe7ea;
+}
+
+@keyframes orderModalIn {
+  from { opacity: 0; transform: translateY(14px) scale(.96); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (orientation: portrait) and (max-width: 700px) {
+  .order-overlay {
+    padding: 12px;
+  }
+
+  .order-modal {
+    width: min(350px, calc(100vw - 22px));
+    padding: 18px 15px;
+    border-radius: 20px;
+  }
+
+  .order-modal h2 {
+    font-size: 21px;
+  }
+
+  .order-result-row {
+    grid-template-columns: 26px 1fr auto;
+    padding: 7px 8px;
+  }
+
+  .order-result-row span {
+    width: 24px;
+    height: 24px;
+  }
+
+  .order-result-row strong {
+    font-size: 12px;
+  }
+
+  .order-result-row em {
+    font-size: 9px;
+  }
+}
+
+/* Disconnect harus selalu berada di atas popup penentuan giliran. */
+.disconnect-overlay { z-index: 14000; }
