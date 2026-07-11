@@ -252,6 +252,7 @@ let freeMoveAnimating = false;
 let freeMoveSelectionStarting = false;
 let freeMoveTapInProgress = false;
 let debtSaleInProgress = false;
+let jailRouletteInProgress = false;
 let suppressBoardInputUntil = 0;
 let lastBoardTapIndex = null;
 let lastBoardTapAt = 0;
@@ -2604,10 +2605,9 @@ function calculateRent(propertyId, diceTotal = 7, stateLike = roomState) {
     let rent = property.rents[Number(ps.level || 0)] || property.rents[0];
 
     if (hasFullGroup(ps.owner, property.group, stateLike)) {
-      // Tarif kompleks pada popup sudah menampilkan tarif dasar kompleks (×2).
-      // Saat pemain benar-benar memiliki seluruh kompleks, sewa efektif kembali
-      // dikalikan 2. Contoh Moscow: $23 → tarif kompleks $46 → sewa efektif $92.
-      rent *= 4;
+      // Kompleks lengkap hanya menggandakan tarif efektif sekali.
+      // Daftar harga dasar pada kartu properti tetap tidak berubah.
+      rent *= 2;
     }
 
     return rent;
@@ -2787,6 +2787,10 @@ async function payJailFine() {
   if (!canIUseJailAction()) return;
 
   const player = roomState.players[mySeat];
+  if (Number(player.money || 0) < 50) {
+    return;
+  }
+
   const updates = {};
   const logs = [`${player.name} membayar $50 dan bebas dari penjara. Pemain dapat langsung bermain pada giliran ini.`];
   let nextMoney = Number(player.money || 0) - 50;
@@ -2807,7 +2811,8 @@ async function payJailFine() {
 
 
 async function rollForJailRoulette() {
-  if (!canIUseJailAction()) return;
+  if (!canIUseJailAction() || jailRouletteInProgress) return;
+  jailRouletteInProgress = true;
 
   const player = roomState.players[mySeat];
   const result = Math.floor(Math.random() * 12) + 1;
@@ -2816,20 +2821,26 @@ async function rollForJailRoulette() {
   const previousRotation = Number(roomState.lastRoulette?.rotation || 0);
   const rotation = getRouletteFinalRotation(previousRotation, result);
 
-  await roomRef.update({
-    isRolling: true,
-    lastDice: [0, result],
-    lastRoulette: {
-      id: rouletteId,
-      result,
-      rotation,
-      createdAt: Date.now(),
-      source: "jail"
-    }
-  });
+  try {
+    await roomRef.update({
+      isRolling: true,
+      lastDice: [0, result],
+      lastRoulette: {
+        id: rouletteId,
+        result,
+        rotation,
+        createdAt: Date.now(),
+        source: "jail"
+      }
+    });
+  } catch (error) {
+    jailRouletteInProgress = false;
+    throw error;
+  }
 
   setTimeout(async () => {
-    const latest = (await roomRef.once("value")).val();
+    try {
+      const latest = (await roomRef.once("value")).val();
     if (!latest?.lastRoulette || latest.lastRoulette.id !== rouletteId) return;
 
     const latestPlayer = latest.players?.[mySeat];
@@ -2854,16 +2865,20 @@ async function rollForJailRoulette() {
         [`players/${mySeat}/jailAttempts`]: 0,
         isRolling: false
       });
-      await addRemoteLog(`${latestPlayer.name} mendapat angka ${result} pada percobaan roulette penjara ke-3. Pemain tetap dibebaskan dan dapat bermain.`);
+      await addRemoteLog(`${latestPlayer.name} gagal mendapat angka 12 pada percobaan penjara ke-3 dan dibebaskan. Giliran ini selesai; pemain dapat bermain normal pada giliran berikutnya.`);
+      await finishTurn();
       return;
     }
 
-    await roomRef.update({
-      [`players/${mySeat}/jailAttempts`]: attempts,
-      isRolling: false
-    });
-    await addRemoteLog(`${latestPlayer.name} gagal keluar dari penjara karena roulette mendapat angka ${result}. Percobaan ${attempts}/3.`);
-    await finishTurn();
+      await roomRef.update({
+        [`players/${mySeat}/jailAttempts`]: attempts,
+        isRolling: false
+      });
+      await addRemoteLog(`${latestPlayer.name} gagal keluar dari penjara karena roulette mendapat angka ${result}. Percobaan ${attempts}/3.`);
+      await finishTurn();
+    } finally {
+      jailRouletteInProgress = false;
+    }
   }, ROULETTE_SPIN_MS + 120);
 }
 
@@ -3393,11 +3408,12 @@ function renderActionPanel() {
   if (player?.inJail && !roomState.pendingAction && !roomState.isRolling) {
     const enabled = canIUseJailAction();
     const jailCards = Number(player.jailFreeCards || 0);
+    const canPayFine = enabled && Number(player.money || 0) >= 50;
     els.actionPanel.innerHTML = `
       <div class="action-title">${escapeHTML(player.name)} di Penjara</div>
       <div class="action-sub">
-        Percobaan keluar: ${Number(player.jailAttempts || 0)}/3. Pilih bayar $50, gunakan kartu Bebas Penjara, atau putar roulette dan dapatkan angka 12.
-        Jika belum mendapat 12 sampai percobaan ke-3, pemain tetap dibebaskan dan dapat bermain pada giliran tersebut.
+        Percobaan keluar: ${Number(player.jailAttempts || 0)}/3. Setiap giliran hanya tersedia satu percobaan roulette.
+        Dapatkan angka 12 untuk langsung bebas. Setelah percobaan ke-3 gagal, pemain dibebaskan dan baru bermain normal pada giliran berikutnya.
       </div>
       ${jailCards > 0 ? `
         <div class="action-row single">
@@ -3406,8 +3422,9 @@ function renderActionPanel() {
       ` : ""}
       <div class="action-row">
         <button class="gold" onclick="rollForJailRoulette()" ${enabled ? "" : "disabled"}>Coba Roulette 12</button>
-        <button class="primary" onclick="payJailFine()" ${enabled ? "" : "disabled"}>Bayar $50 Bebas</button>
+        <button class="primary" onclick="payJailFine()" ${canPayFine ? "" : "disabled"} title="${canPayFine ? "Bayar $50 untuk bebas" : "Uang tidak cukup untuk membayar $50"}">Bayar $50 Bebas</button>
       </div>
+      ${Number(player.money || 0) < 50 ? `<div class="action-sub jail-insufficient-note">Uang tidak cukup. Gunakan kartu Bebas Penjara atau coba Roulette 12.</div>` : ""}
     `;
     return;
   }
@@ -4903,12 +4920,11 @@ function renderCardPopup() {
   }
 
   if (actionType === "cardChoiceMoveBack") {
-    els.cardActions.classList.remove("hidden");
-    els.cardActions.innerHTML = `
-      <button class="gold" type="button" onclick="chooseCardMoveBack(2, event)" ${isActor ? "" : "disabled"}>Mundur 2 Petak</button>
-      <button class="primary" type="button" onclick="chooseCardMoveBack(5, event)" ${isActor ? "" : "disabled"}>Mundur 5 Petak</button>
-    `;
-    els.cardContinueBtn.classList.add("hidden");
+    els.cardActions.classList.add("hidden");
+    els.cardActions.innerHTML = "";
+    els.cardContinueBtn.classList.remove("hidden");
+    els.cardContinueBtn.textContent = "Lihat Posisi di Papan";
+    els.cardContinueBtn.disabled = false;
     return;
   }
 
@@ -5362,7 +5378,12 @@ async function closeCardAndFinishTurn() {
     return;
   }
 
-  if (["cardChoiceFineOrChance", "cardChoiceMoveBack", "cardChooseBuild", "taxExemptionChoice"].includes(actionType)) {
+  if (actionType === "cardChoiceMoveBack") {
+    hideCardPopupLocal();
+    return;
+  }
+
+  if (["cardChoiceFineOrChance", "cardChooseBuild", "taxExemptionChoice"].includes(actionType)) {
     return;
   }
 
@@ -5474,14 +5495,13 @@ function showPropertyDetailPopup(propertyId) {
 
   if (property.kind === "city") {
     const hasComplexBonus = Boolean(owner && hasFullGroup(ps.owner, property.group, roomState));
-    const rentMultiplier = hasComplexBonus ? 2 : 1;
     els.cardText.innerHTML = `
-      <div class="detail-card-meta">Harga tanah <strong>${formatMoney(price)}</strong> • Hipotik <strong>${formatMoney(property.mortgage)}</strong>${hasComplexBonus ? " • Kompleks lengkap: tarif efektif ×2" : ""}</div>
+      <div class="detail-card-meta">Harga tanah <strong>${formatMoney(price)}</strong> • Hipotik <strong>${formatMoney(property.mortgage)}</strong>${hasComplexBonus ? " • Kompleks lengkap: sewa saat ini ×2" : ""}</div>
       <table class="popup-rent-table">
-        ${property.rents.map((rent, index) => `<tr><td>${RENT_LABELS[index]}</td><td>${formatMoney(rent * rentMultiplier)}</td></tr>`).join("")}
+        ${property.rents.map((rent, index) => `<tr><td>${RENT_LABELS[index]}</td><td>${formatMoney(rent)}</td></tr>`).join("")}
         <tr><td>Harga bangunan</td><td>${formatMoney(property.buildingCost)}</td></tr>
         <tr><td>Level saat ini</td><td>${RENT_LABELS[Number(ps.level || 0)]}</td></tr>
-        <tr><td>Sewa saat ini</td><td>${owner ? formatMoney(currentRent) : "-"}</td></tr>
+        <tr><td>Sewa saat ini${hasComplexBonus ? " (×2)" : ""}</td><td>${owner ? formatMoney(currentRent) : "-"}</td></tr>
       </table>
     `;
   } else if (property.kind === "airport") {

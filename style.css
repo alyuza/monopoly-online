@@ -2825,3 +2825,333 @@ body.history-open {
     height: 20px;
   }
 }
+
+/* V19: tablet portrait mengikuti susunan mobile, tetapi memakai ruang lebih lebar. */
+.jail-insufficient-note {
+  margin-top: 5px;
+  color: #a32727 !important;
+  font-weight: 900;
+}
+
+@media (orientation: portrait) and (min-width: 701px) and (max-width: 1100px) {
+  html,
+  body {
+    width: 100%;
+    min-height: 100%;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  body {
+    height: auto;
+    min-height: 100dvh;
+    padding:
+      max(6px, env(safe-area-inset-top))
+      max(6px, env(safe-area-inset-right))
+      max(6px, env(safe-area-inset-bottom))
+      max(6px, env(safe-area-inset-left));
+  }
+
+  .app {
+    width: min(100%, 980px);
+    max-width: 980px;
+    min-width: 0;
+    margin: 0 auto;
+  }
+
+  .app.game-active {
+    display: flex;
+    flex-direction: column;
+    min-height: 100dvh;
+  }
+
+  .app.game-active #gamePanel {
+    order: 1;
+  }
+
+  .app.game-active .topbar {
+    order: 2;
+    margin: 7px 0 0;
+  }
+
+  .topbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px 12px;
+    padding: 10px 12px;
+    border-radius: 16px;
+  }
+
+  .topbar h1 {
+    font-size: clamp(22px, 3.3vw, 30px);
+  }
+
+  .game-subtitle {
+    font-size: 12px !important;
+  }
+
+  .desktop-subtitle {
+    display: none;
+  }
+
+  .mobile-subtitle {
+    display: inline;
+  }
+
+  .room-info {
+    display: grid;
+    grid-template-columns: minmax(150px, 1.2fr) minmax(100px, .8fr) minmax(88px, .68fr);
+    gap: 7px;
+    width: min(470px, 100%);
+  }
+
+  #roomBadge,
+  .room-info button {
+    min-width: 0;
+    min-height: 40px;
+    height: 40px;
+    padding: 7px 10px;
+    border-radius: 10px;
+    font-size: 12px;
+  }
+
+  .orientation-hint {
+    display: none !important;
+  }
+
+  .game-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+    align-items: start;
+    overflow: visible;
+  }
+
+  .board-column {
+    display: block;
+    min-width: 0;
+  }
+
+  .board-shell {
+    width: 100%;
+    padding: 0;
+    overflow: hidden;
+    border-width: 3px;
+    border-radius: 12px;
+    background: #14213d;
+    box-shadow: 0 7px 20px rgba(0, 0, 0, .18);
+  }
+
+  #gameCanvas {
+    width: 100%;
+    min-height: 0;
+    margin: 0;
+    aspect-ratio: 1 / 1;
+    overflow: hidden;
+    border: 0;
+    border-radius: 0;
+    background: #14213d;
+  }
+
+  #gameCanvas canvas {
+    display: block;
+    width: 100% !important;
+    height: 100% !important;
+  }
+
+  .board-log-card {
+    display: none !important;
+  }
+
+  .side-panel {
+    width: 100%;
+    height: auto;
+    min-height: 0;
+    max-height: none;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) clamp(220px, 31vw, 290px);
+    grid-template-rows: auto auto;
+    grid-template-areas:
+      "action control"
+      "players control";
+    gap: 6px;
+    padding: 6px;
+    overflow: visible;
+    border-width: 2px;
+    border-radius: 12px;
+    align-items: start;
+    align-content: start;
+  }
+
+  .side-panel > .panel-card,
+  .action-card,
+  .players-card,
+  .control-card {
+    height: auto;
+    min-height: 0;
+    max-height: none;
+    margin: 0;
+    padding: 10px;
+    overflow: visible !important;
+    border-radius: 10px;
+  }
+
+  .action-card {
+    grid-area: action;
+  }
+
+  .players-card {
+    grid-area: players;
+  }
+
+  .control-card {
+    grid-area: control;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .side-panel .panel-card h2 {
+    margin: 0 0 7px;
+    font-size: 16px;
+  }
+
+  .action-card .action-title {
+    font-size: 15px;
+  }
+
+  .action-card .action-sub,
+  .action-card .price-pill {
+    font-size: 11px;
+    line-height: 1.32;
+  }
+
+  .action-card button,
+  .control-card .full {
+    min-height: 38px;
+    padding: 7px 9px;
+    font-size: 11px;
+  }
+
+  .players-list {
+    max-height: none;
+    overflow: visible;
+    gap: 7px;
+  }
+
+  .player-row {
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    gap: 7px;
+    padding: 8px;
+  }
+
+  .player-dot {
+    width: 30px;
+    height: 30px;
+    font-size: 12px;
+  }
+
+  .player-name {
+    font-size: 14px;
+  }
+
+  .player-sub {
+    font-size: 9px;
+    white-space: normal;
+  }
+
+  .money {
+    font-size: 14px;
+  }
+
+  .owned-tags {
+    grid-column: 2 / 4;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .owned-tag {
+    font-size: 8px;
+  }
+
+  .history-fab {
+    top: 34px;
+    right: 8px;
+    width: 36px;
+    height: 36px;
+    min-height: 36px;
+    font-size: 18px;
+  }
+
+  .control-card h2,
+  .control-card .turn-box {
+    padding-right: 40px;
+  }
+
+  .control-card .label {
+    font-size: 9px;
+  }
+
+  .control-card .turn-box strong {
+    max-width: 180px;
+    font-size: 23px;
+  }
+
+  .control-card .roulette-box {
+    gap: 5px;
+    margin: 8px 0 6px;
+  }
+
+  .control-card .roulette-wheel-wrap {
+    width: 154px;
+    height: 154px;
+  }
+
+  .control-card .roulette-wheel {
+    width: 148px;
+    height: 148px;
+    border-width: 6px;
+  }
+
+  .control-card .roulette-number {
+    width: 22px;
+    height: 22px;
+    margin-left: -11px;
+    margin-top: -11px;
+    font-size: 10px;
+  }
+
+  .control-card .roulette-number.n1 { transform: rotate(-90deg) translate(54px) rotate(90deg); }
+  .control-card .roulette-number.n2 { transform: rotate(-60deg) translate(54px) rotate(60deg); }
+  .control-card .roulette-number.n3 { transform: rotate(-30deg) translate(54px) rotate(30deg); }
+  .control-card .roulette-number.n4 { transform: rotate(0deg) translate(54px) rotate(0deg); }
+  .control-card .roulette-number.n5 { transform: rotate(30deg) translate(54px) rotate(-30deg); }
+  .control-card .roulette-number.n6 { transform: rotate(60deg) translate(54px) rotate(-60deg); }
+  .control-card .roulette-number.n7 { transform: rotate(90deg) translate(54px) rotate(-90deg); }
+  .control-card .roulette-number.n8 { transform: rotate(120deg) translate(54px) rotate(-120deg); }
+  .control-card .roulette-number.n9 { transform: rotate(150deg) translate(54px) rotate(-150deg); }
+  .control-card .roulette-number.n10 { transform: rotate(180deg) translate(54px) rotate(-180deg); }
+  .control-card .roulette-number.n11 { transform: rotate(210deg) translate(54px) rotate(-210deg); }
+  .control-card .roulette-number.n12 { transform: rotate(240deg) translate(54px) rotate(-240deg); }
+
+  .control-card .roulette-center {
+    width: 60px;
+    height: 60px;
+  }
+
+  .control-card .roulette-center span {
+    font-size: 24px;
+  }
+
+  .control-card .roulette-caption,
+  .control-card .status-text {
+    font-size: 9px;
+    line-height: 1.25;
+  }
+
+  .card-popup.player-detail,
+  .card-popup.property-detail {
+    width: min(520px, calc(100vw - 42px));
+    max-height: calc(100dvh - 44px);
+  }
+}
