@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Monopoly Board Game</title>
-  <link rel="stylesheet" href="./style.css?v=full-card-decks-1" />
+  <link rel="stylesheet" href="./style.css?v=voice-chat-1" />
 </head>
 <body>
   <main id="appRoot" class="app">
@@ -39,7 +39,7 @@
         <div class="divider">atau</div>
 
         <label>Kode Room</label>
-        <input id="roomCodeInput" type="text" placeholder="Contoh: ATHO123" maxlength="8" />
+        <input id="roomCodeInput" type="text" placeholder="Contoh: ATHO8K7M2Q9P" maxlength="12" />
 
         <div class="setup-actions">
           <button id="joinRoomBtn" class="gold">Join Room</button>
@@ -173,9 +173,11 @@
   <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
 
   <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-check-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
 
   <script src="./firebase-config.js"></script>
-  <script src="./game.js?v=full-card-decks-1"></script>
+  <script src="./game.js?v=voice-chat-1"></script>
 </body>
 </html>

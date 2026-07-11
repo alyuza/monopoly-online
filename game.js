@@ -234,7 +234,10 @@ function appendDeckResetUpdates(stateLike, updates) {
 }
 
 let app = null;
+let auth = null;
 let db = null;
+let currentAuthUid = "";
+let firebaseReadyPromise = null;
 let roomRef = null;
 let roomCode = "";
 let mySeat = null;
@@ -278,6 +281,22 @@ let playerPaymentToastTimer = null;
 let playerPaymentToastId = "";
 let rouletteSoundTimers = [];
 let rouletteSoundId = "";
+
+// Voice chat WebRTC: Firebase hanya dipakai sebagai signaling.
+const VOICE_SIGNAL_MAX_AGE_MS = 60_000;
+const DEFAULT_VOICE_ICE_SERVERS = [
+  { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] }
+];
+let voiceNetworkStarted = false;
+let voiceSignalInboxRef = null;
+let voiceSignalHandler = null;
+let voiceSignalStartedAt = 0;
+let localVoiceStream = null;
+let localVoiceMicEnabled = false;
+let voiceInteractionUnlocked = false;
+let voiceToggleInProgress = false;
+const voicePeers = new Map();
+const voiceSpeakerMuted = new Map();
 
 const ROOM_SESSION_KEY = "atho_room_session";
 
@@ -335,7 +354,7 @@ const els = {
   cardContinueBtn: document.getElementById("cardContinueBtn")
 };
 
-function initFirebase() {
+async function initFirebase() {
   const config = window.FIREBASE_CONFIG;
 
   if (!config || String(config.apiKey || "").includes("PASTE")) {
@@ -343,14 +362,34 @@ function initFirebase() {
     throw new Error("Firebase config is missing.");
   }
 
-  app = firebase.initializeApp(config);
+  app = firebase.apps?.length ? firebase.app() : firebase.initializeApp(config);
+
+  const appCheckSiteKey = String(window.FIREBASE_APP_CHECK_SITE_KEY || "").trim();
+  if (appCheckSiteKey && !appCheckSiteKey.includes("PASTE") && firebase.appCheck) {
+    firebase.appCheck().activate(appCheckSiteKey, true);
+  }
+
+  auth = firebase.auth();
+  await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+
+  let user = auth.currentUser;
+  if (!user) {
+    const credential = await auth.signInAnonymously();
+    user = credential.user;
+  }
+
+  if (!user?.uid) {
+    throw new Error("Firebase Anonymous Authentication gagal membuat identitas pengguna.");
+  }
+
+  currentAuthUid = user.uid;
   db = firebase.database();
 }
 
 function randomRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let suffix = "";
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 8; i++) {
     suffix += chars[Math.floor(Math.random() * chars.length)];
   }
   return `ATHO${suffix}`;
@@ -377,6 +416,7 @@ function saveRoomSession(playerName = "") {
     roomCode,
     seat: Number(mySeat),
     playerId: myPlayerId,
+    authUid: currentAuthUid,
     playerName: cleanName(playerName || roomState?.players?.[mySeat]?.name || "Pemain"),
     savedAt: Date.now()
   }));
@@ -404,6 +444,7 @@ async function returnToSetupView(message = "") {
   membershipResetInProgress = true;
 
   try {
+    await stopVoiceChatNetwork();
     if (disconnectExpiryTimer) clearTimeout(disconnectExpiryTimer);
     if (disconnectCountdownTimer) clearInterval(disconnectCountdownTimer);
     disconnectExpiryTimer = null;
@@ -436,8 +477,9 @@ async function returnToSetupView(message = "") {
 }
 
 function isCurrentMembershipValid(stateLike = roomState) {
-  if (mySeat === null || !myPlayerId) return true;
-  return stateLike?.players?.[mySeat]?.id === myPlayerId;
+  if (mySeat === null || !myPlayerId || !currentAuthUid) return true;
+  const player = stateLike?.players?.[mySeat];
+  return player?.id === myPlayerId && player?.authUid === currentAuthUid;
 }
 
 function getDisconnectDeadline(player) {
@@ -463,6 +505,7 @@ function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 3
 
   leavingPlayer.connected = false;
   leavingPlayer.id = "";
+  leavingPlayer.authUid = "";
   leavingPlayer.inGame = false;
   leavingPlayer.isHost = false;
   leavingPlayer.roulette12Streak = 0;
@@ -685,6 +728,7 @@ async function configureCurrentPresence() {
 
   await playerPresenceRef.set({
     playerId: myPlayerId,
+    authUid: currentAuthUid,
     connectedAt: serverTimestamp
   });
 
@@ -721,7 +765,7 @@ async function detachCurrentPresence({ cancelDisconnect = true } = {}) {
 
 async function setupCurrentPresence() {
   await detachCurrentPresence({ cancelDisconnect: true });
-  if (!db || !roomRef || mySeat === null || !myPlayerId) return;
+  if (!db || !roomRef || mySeat === null || !myPlayerId || !currentAuthUid) return;
 
   presenceConnectionId = `conn_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   playerPresenceRef = roomRef.child(`presence/${mySeat}/${presenceConnectionId}`);
@@ -761,7 +805,7 @@ async function restoreRoomSession() {
 
   try {
     myPlayerId = makePlayerId();
-    if (session.playerId !== myPlayerId) {
+    if (session.playerId !== myPlayerId || session.authUid !== currentAuthUid) {
       clearRoomSession();
       return;
     }
@@ -782,7 +826,7 @@ async function restoreRoomSession() {
     }
 
     const matchingPlayer = Object.values(state.players)
-      .find(player => player?.id === myPlayerId);
+      .find(player => player?.id === myPlayerId && player?.authUid === currentAuthUid);
 
     if (!matchingPlayer) {
       clearRoomSession();
@@ -865,6 +909,7 @@ function createInitialRoom(hostName) {
       seat: i,
       role: i < MAX_GAME_PLAYERS ? "player" : "spectator",
       id: i === 0 ? myPlayerId : "",
+      authUid: i === 0 ? currentAuthUid : "",
       name: i === 0 ? hostName : PLAYER_DEFAULTS[i],
       color: PLAYER_COLORS[i],
       money: i < MAX_GAME_PLAYERS ? START_MONEY : 0,
@@ -911,6 +956,7 @@ function createInitialRoom(hostName) {
 }
 
 async function createRoom() {
+  await firebaseReadyPromise;
   const playerName = cleanName(els.playerNameInput.value);
   myPlayerId = makePlayerId();
   roomCode = randomRoomCode();
@@ -925,6 +971,7 @@ async function createRoom() {
 }
 
 async function joinRoom() {
+  await firebaseReadyPromise;
   const playerName = cleanName(els.playerNameInput.value);
   const code = String(els.roomCodeInput.value || "").trim().toUpperCase();
 
@@ -948,7 +995,7 @@ async function joinRoom() {
   let seat = null;
 
   for (let i = 0; i < MAX_ROOM_MEMBERS; i++) {
-    if (players[i]?.id === myPlayerId) {
+    if (players[i]?.id === myPlayerId && players[i]?.authUid === currentAuthUid) {
       seat = i;
       break;
     }
@@ -977,6 +1024,7 @@ async function joinRoom() {
     role,
     color: players[mySeat]?.color || PLAYER_COLORS[mySeat],
     id: myPlayerId,
+    authUid: currentAuthUid,
     name: playerName,
     connected: true,
     disconnectedAt: null
@@ -1022,6 +1070,10 @@ function enterGameView() {
   if (!gameScene) {
     startPhaser();
   }
+
+  startVoiceChatNetwork().catch(error => {
+    console.warn("Voice chat gagal diinisialisasi.", error);
+  });
 }
 
 function subscribeRoom() {
@@ -1053,6 +1105,7 @@ function subscribeRoom() {
     }
 
     renderUI();
+    syncVoicePeers(roomState);
 
     if (gameScene) {
       gameScene.renderRoomState(roomState);
@@ -3942,6 +3995,531 @@ async function runPlayerMoneyAnimationQueue(seat) {
   state.running = false;
 }
 
+
+function isVoiceChatSupported() {
+  return Boolean(
+    window.RTCPeerConnection
+    && navigator.mediaDevices
+    && typeof navigator.mediaDevices.getUserMedia === "function"
+  );
+}
+
+function getVoiceIceServers() {
+  const configured = window.VOICE_ICE_SERVERS;
+  if (Array.isArray(configured) && configured.length) return configured;
+  return DEFAULT_VOICE_ICE_SERVERS;
+}
+
+function getVoiceSpeakerPreferenceKey(remoteSeat) {
+  const remote = roomState?.players?.[remoteSeat];
+  const identity = remote?.id || `seat-${remoteSeat}`;
+  return `atho_voice_speaker_muted_${roomCode}_${identity}`;
+}
+
+function isRemoteSpeakerMuted(remoteSeat) {
+  const key = getVoiceSpeakerPreferenceKey(remoteSeat);
+  if (voiceSpeakerMuted.has(key)) return voiceSpeakerMuted.get(key) === true;
+
+  let muted = false;
+  try {
+    muted = localStorage.getItem(key) === "1";
+  } catch (error) {
+    console.warn("Preferensi speaker tidak dapat dibaca.", error);
+  }
+
+  voiceSpeakerMuted.set(key, muted);
+  return muted;
+}
+
+function saveRemoteSpeakerMuted(remoteSeat, muted) {
+  const key = getVoiceSpeakerPreferenceKey(remoteSeat);
+  voiceSpeakerMuted.set(key, Boolean(muted));
+  try {
+    localStorage.setItem(key, muted ? "1" : "0");
+  } catch (error) {
+    console.warn("Preferensi speaker tidak dapat disimpan.", error);
+  }
+}
+
+function getVoiceControlIcon(kind, disabled) {
+  const slash = disabled
+    ? '<line x1="4" y1="4" x2="28" y2="28" stroke="currentColor" stroke-width="3.6" stroke-linecap="round" />'
+    : "";
+
+  if (kind === "mic") {
+    return `
+      <svg viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <rect x="11" y="4" width="10" height="16" rx="5" fill="currentColor"></rect>
+        <path d="M7 15.5a9 9 0 0 0 18 0M16 24v5M11 29h10" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"></path>
+        ${slash}
+      </svg>
+    `;
+  }
+
+  return `
+    <svg viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+      <path d="M5 12h6l7-6v20l-7-6H5z" fill="currentColor"></path>
+      <path d="M22 11a7 7 0 0 1 0 10M25 7a12 12 0 0 1 0 18" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"></path>
+      ${slash}
+    </svg>
+  `;
+}
+
+function unlockVoiceAudioPlayback() {
+  voiceInteractionUnlocked = true;
+  voicePeers.forEach(peer => {
+    if (!peer?.audio || peer.audio.muted) return;
+    peer.audio.play().catch(() => {});
+  });
+}
+
+async function sendVoiceSignal(remoteSeat, payload) {
+  if (!voiceNetworkStarted || !roomRef || mySeat === null) return;
+  const remotePlayer = roomState?.players?.[remoteSeat];
+  if (!remotePlayer?.id || !isPlayerConnectedInState(roomState, remotePlayer)) return;
+
+  const message = {
+    fromSeat: Number(mySeat),
+    fromPlayerId: myPlayerId,
+    authUid: currentAuthUid,
+    targetPlayerId: remotePlayer.id,
+    createdAt: firebase.database.ServerValue.TIMESTAMP
+  };
+
+  if (payload?.description) {
+    message.description = {
+      type: payload.description.type,
+      sdp: payload.description.sdp || ""
+    };
+  }
+
+  if (payload?.candidate) {
+    message.candidate = payload.candidate;
+  }
+
+  await db.ref(`voiceSignals/${roomCode}/${remoteSeat}`).push().set(message);
+}
+
+async function negotiateVoicePeer(peer) {
+  if (!peer || peer.closed || peer.makingOffer || !voiceNetworkStarted) return;
+  if (peer.pc.signalingState !== "stable") return;
+
+  try {
+    peer.makingOffer = true;
+    await peer.pc.setLocalDescription();
+    if (peer.pc.localDescription) {
+      await sendVoiceSignal(peer.remoteSeat, { description: peer.pc.localDescription });
+    }
+  } catch (error) {
+    console.warn(`Negosiasi voice dengan seat ${peer.remoteSeat} gagal.`, error);
+  } finally {
+    peer.makingOffer = false;
+  }
+}
+
+function closeVoicePeer(remoteSeat) {
+  const peer = voicePeers.get(Number(remoteSeat));
+  if (!peer) return;
+
+  peer.closed = true;
+  if (peer.reconnectTimer) clearTimeout(peer.reconnectTimer);
+  peer.reconnectTimer = null;
+
+  try {
+    peer.pc.onicecandidate = null;
+    peer.pc.ontrack = null;
+    peer.pc.onnegotiationneeded = null;
+    peer.pc.onconnectionstatechange = null;
+    peer.pc.close();
+  } catch (error) {
+    console.warn("Peer voice gagal ditutup dengan bersih.", error);
+  }
+
+  if (peer.audio) {
+    peer.audio.pause();
+    peer.audio.srcObject = null;
+    peer.audio.remove();
+  }
+
+  voicePeers.delete(Number(remoteSeat));
+}
+
+function ensureVoicePeer(remoteSeat) {
+  const normalizedSeat = Number(remoteSeat);
+  if (!voiceNetworkStarted || !isVoiceChatSupported() || normalizedSeat === Number(mySeat)) return null;
+  if (voicePeers.has(normalizedSeat)) return voicePeers.get(normalizedSeat);
+
+  const remotePlayer = roomState?.players?.[normalizedSeat];
+  if (!remotePlayer?.id || !isPlayerConnectedInState(roomState, remotePlayer)) return null;
+
+  const pc = new RTCPeerConnection({ iceServers: getVoiceIceServers() });
+  const audio = document.createElement("audio");
+  audio.autoplay = true;
+  audio.playsInline = true;
+  audio.setAttribute("playsinline", "");
+  audio.className = "voice-remote-audio";
+  audio.dataset.seat = String(normalizedSeat);
+  audio.muted = isRemoteSpeakerMuted(normalizedSeat);
+  document.body.appendChild(audio);
+
+  const peer = {
+    remoteSeat: normalizedSeat,
+    pc,
+    audio,
+    transceiver: null,
+    makingOffer: false,
+    ignoreOffer: false,
+    isSettingRemoteAnswerPending: false,
+    polite: Number(mySeat) > normalizedSeat,
+    pendingCandidates: [],
+    reconnectTimer: null,
+    closed: false
+  };
+
+  voicePeers.set(normalizedSeat, peer);
+
+  peer.transceiver = pc.addTransceiver("audio", {
+    direction: localVoiceMicEnabled && localVoiceStream ? "sendrecv" : "recvonly"
+  });
+
+  const localTrack = localVoiceStream?.getAudioTracks?.()[0] || null;
+  if (localTrack && localVoiceMicEnabled) {
+    peer.transceiver.sender.replaceTrack(localTrack).catch(error => {
+      console.warn("Track microphone gagal dipasang ke peer baru.", error);
+    });
+  }
+
+  pc.onicecandidate = event => {
+    if (!event.candidate) return;
+    const candidate = typeof event.candidate.toJSON === "function"
+      ? event.candidate.toJSON()
+      : {
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          usernameFragment: event.candidate.usernameFragment || null
+        };
+
+    sendVoiceSignal(normalizedSeat, { candidate }).catch(error => {
+      console.warn("ICE candidate voice gagal dikirim.", error);
+    });
+  };
+
+  pc.ontrack = event => {
+    const stream = event.streams?.[0] || new MediaStream([event.track]);
+    audio.srcObject = stream;
+    audio.muted = isRemoteSpeakerMuted(normalizedSeat);
+    if (voiceInteractionUnlocked || !audio.muted) {
+      audio.play().catch(() => {});
+    }
+  };
+
+  pc.onnegotiationneeded = () => {
+    // Seat lebih kecil menjadi inisiator pertama agar Safari/Chrome tidak
+    // saling membuat offer pada saat yang sama. Setelah koneksi terbentuk,
+    // kedua sisi tetap boleh melakukan renegosiasi ketika mic berubah.
+    if (!pc.remoteDescription && Number(mySeat) > normalizedSeat) return;
+    negotiateVoicePeer(peer);
+  };
+
+  pc.onconnectionstatechange = () => {
+    const state = pc.connectionState;
+    if (state === "connected") {
+      if (peer.reconnectTimer) clearTimeout(peer.reconnectTimer);
+      peer.reconnectTimer = null;
+      refreshVoiceControlButtons();
+      return;
+    }
+
+    if (state !== "failed" && state !== "disconnected" && state !== "closed") return;
+    if (peer.reconnectTimer) clearTimeout(peer.reconnectTimer);
+
+    peer.reconnectTimer = setTimeout(() => {
+      peer.reconnectTimer = null;
+      const currentRemote = roomState?.players?.[normalizedSeat];
+      const shouldReconnect = voiceNetworkStarted
+        && currentRemote?.id
+        && isPlayerConnectedInState(roomState, currentRemote);
+
+      closeVoicePeer(normalizedSeat);
+      if (shouldReconnect) {
+        const replacement = ensureVoicePeer(normalizedSeat);
+        if (replacement) setTimeout(() => negotiateVoicePeer(replacement), 120);
+      }
+      refreshVoiceControlButtons();
+    }, state === "failed" ? 600 : 4500);
+  };
+
+  if (Number(mySeat) < normalizedSeat) {
+    setTimeout(() => negotiateVoicePeer(peer), 100 + normalizedSeat * 20);
+  }
+  return peer;
+}
+
+async function processVoiceSignal(snapshot, retryCount = 0) {
+  const message = snapshot.val();
+  if (!message || !voiceNetworkStarted || mySeat === null) return;
+
+  const createdAt = Number(message.createdAt || 0);
+  if (createdAt && Date.now() - createdAt > VOICE_SIGNAL_MAX_AGE_MS) {
+    snapshot.ref.remove().catch(() => {});
+    return;
+  }
+  if (createdAt && createdAt < voiceSignalStartedAt - 5000) {
+    snapshot.ref.remove().catch(() => {});
+    return;
+  }
+  if (message.targetPlayerId !== myPlayerId) {
+    snapshot.ref.remove().catch(() => {});
+    return;
+  }
+
+  const remoteSeat = Number(message.fromSeat);
+  if (!Number.isInteger(remoteSeat) || remoteSeat === Number(mySeat)) {
+    snapshot.ref.remove().catch(() => {});
+    return;
+  }
+
+  const remotePlayer = roomState?.players?.[remoteSeat];
+  if ((!remotePlayer?.id || remotePlayer.id !== message.fromPlayerId) && retryCount < 12) {
+    setTimeout(() => {
+      processVoiceSignal(snapshot, retryCount + 1).catch(() => {});
+    }, 180);
+    return;
+  }
+  snapshot.ref.remove().catch(() => {});
+  if (!remotePlayer?.id || remotePlayer.id !== message.fromPlayerId) return;
+
+  const peer = ensureVoicePeer(remoteSeat);
+  if (!peer || peer.closed) return;
+
+  try {
+    if (message.description) {
+      const description = message.description;
+      const readyForOffer = !peer.makingOffer
+        && (peer.pc.signalingState === "stable" || peer.isSettingRemoteAnswerPending);
+      const offerCollision = description.type === "offer" && !readyForOffer;
+      peer.ignoreOffer = !peer.polite && offerCollision;
+      if (peer.ignoreOffer) return;
+
+      if (offerCollision && peer.polite && peer.pc.signalingState !== "stable") {
+        await peer.pc.setLocalDescription({ type: "rollback" }).catch(() => {});
+      }
+
+      peer.isSettingRemoteAnswerPending = description.type === "answer";
+      await peer.pc.setRemoteDescription(description);
+      peer.isSettingRemoteAnswerPending = false;
+
+      while (peer.pendingCandidates.length) {
+        const candidate = peer.pendingCandidates.shift();
+        await peer.pc.addIceCandidate(candidate).catch(error => {
+          console.warn("ICE candidate tertunda gagal diterapkan.", error);
+        });
+      }
+
+      if (description.type === "offer") {
+        await peer.pc.setLocalDescription();
+        if (peer.pc.localDescription) {
+          await sendVoiceSignal(remoteSeat, { description: peer.pc.localDescription });
+        }
+      }
+    }
+
+    if (message.candidate) {
+      if (peer.pc.remoteDescription) {
+        await peer.pc.addIceCandidate(message.candidate);
+      } else {
+        peer.pendingCandidates.push(message.candidate);
+      }
+    }
+  } catch (error) {
+    if (!peer.ignoreOffer) {
+      console.warn(`Signal voice dari seat ${remoteSeat} gagal diproses.`, error);
+    }
+  }
+}
+
+function syncVoicePeers(stateLike = roomState) {
+  if (!voiceNetworkStarted || !stateLike?.players) return;
+
+  const activeRemoteSeats = new Set(
+    Object.values(stateLike.players)
+      .filter(player => player?.id)
+      .filter(player => Number(player.seat) !== Number(mySeat))
+      .filter(player => isPlayerConnectedInState(stateLike, player))
+      .map(player => Number(player.seat))
+  );
+
+  activeRemoteSeats.forEach(seat => ensureVoicePeer(seat));
+  Array.from(voicePeers.keys()).forEach(seat => {
+    if (!activeRemoteSeats.has(Number(seat))) closeVoicePeer(seat);
+  });
+
+  refreshVoiceControlButtons();
+}
+
+async function attachLocalMicrophoneToPeers(track) {
+  const tasks = [];
+
+  voicePeers.forEach(peer => {
+    if (!peer?.transceiver || peer.closed) return;
+    tasks.push((async () => {
+      await peer.transceiver.sender.replaceTrack(track || null);
+      peer.transceiver.direction = track ? "sendrecv" : "recvonly";
+      await negotiateVoicePeer(peer);
+    })());
+  });
+
+  await Promise.allSettled(tasks);
+}
+
+async function toggleLocalMicrophone() {
+  if (voiceToggleInProgress) return;
+  if (!isVoiceChatSupported()) {
+    alert("Voice chat tidak didukung oleh browser ini atau halaman belum menggunakan HTTPS.");
+    return;
+  }
+
+  voiceToggleInProgress = true;
+  unlockVoiceAudioPlayback();
+
+  try {
+    if (localVoiceMicEnabled) {
+      const oldStream = localVoiceStream;
+      localVoiceMicEnabled = false;
+      localVoiceStream = null;
+      await attachLocalMicrophoneToPeers(null);
+      oldStream?.getTracks?.().forEach(track => track.stop());
+    } else {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: false,
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1
+        }
+      });
+
+      localVoiceStream = stream;
+      localVoiceMicEnabled = true;
+      const track = stream.getAudioTracks()[0] || null;
+      if (!track) throw new Error("Track audio tidak tersedia.");
+      await attachLocalMicrophoneToPeers(track);
+    }
+  } catch (error) {
+    localVoiceMicEnabled = false;
+    await attachLocalMicrophoneToPeers(null).catch(() => {});
+    localVoiceStream?.getTracks?.().forEach(track => track.stop());
+    localVoiceStream = null;
+    console.warn("Microphone gagal diaktifkan.", error);
+    alert("Microphone tidak dapat diaktifkan. Periksa izin microphone pada browser lalu coba lagi.");
+  } finally {
+    voiceToggleInProgress = false;
+    refreshVoiceControlButtons();
+  }
+}
+
+function toggleRemoteSpeaker(remoteSeat) {
+  const normalizedSeat = Number(remoteSeat);
+  const muted = !isRemoteSpeakerMuted(normalizedSeat);
+  saveRemoteSpeakerMuted(normalizedSeat, muted);
+
+  const peer = voicePeers.get(normalizedSeat);
+  if (peer?.audio) {
+    peer.audio.muted = muted;
+    if (!muted) {
+      unlockVoiceAudioPlayback();
+      peer.audio.play().catch(() => {});
+    }
+  }
+
+  refreshVoiceControlButtons();
+}
+
+function updateVoiceControlButton(row, player, playerConnected) {
+  const button = row?.querySelector('[data-role="voice-control"]');
+  if (!button || !player?.id) return;
+
+  const seat = Number(player.seat);
+  const supported = isVoiceChatSupported();
+  button.classList.remove("hidden", "voice-mic", "voice-speaker", "voice-on", "voice-off", "voice-offline");
+
+  if (seat === Number(mySeat)) {
+    const micOff = !localVoiceMicEnabled;
+    button.classList.add("voice-mic", micOff ? "voice-off" : "voice-on");
+    button.innerHTML = getVoiceControlIcon("mic", micOff);
+    button.disabled = !supported || voiceToggleInProgress;
+    button.setAttribute("aria-label", micOff ? "Aktifkan microphone saya" : "Matikan microphone saya");
+    button.title = micOff ? "Mic mati — ketuk untuk menyalakan" : "Mic aktif — ketuk untuk mematikan";
+    return;
+  }
+
+  const speakerOff = isRemoteSpeakerMuted(seat);
+  button.classList.add("voice-speaker", speakerOff ? "voice-off" : "voice-on");
+  if (!playerConnected) button.classList.add("voice-offline");
+  button.innerHTML = getVoiceControlIcon("speaker", speakerOff);
+  button.disabled = !supported || !playerConnected;
+  button.setAttribute("aria-label", speakerOff
+    ? `Nyalakan suara ${player.name}`
+    : `Matikan suara ${player.name}`);
+  button.title = playerConnected
+    ? (speakerOff ? `Speaker ${player.name} mati` : `Speaker ${player.name} aktif`)
+    : `${player.name} sedang offline`;
+}
+
+function refreshVoiceControlButtons() {
+  if (!els.playersList || !roomState?.players) return;
+  els.playersList.querySelectorAll('.player-row[data-seat]').forEach(row => {
+    const seat = Number(row.dataset.seat);
+    const player = roomState.players?.[seat];
+    if (!player?.id) return;
+    updateVoiceControlButton(row, player, isPlayerConnectedInState(roomState, player));
+  });
+}
+
+async function startVoiceChatNetwork() {
+  if (voiceNetworkStarted || !roomRef || mySeat === null) return;
+  voiceNetworkStarted = true;
+  voiceSignalStartedAt = Date.now();
+
+  if (!isVoiceChatSupported()) {
+    refreshVoiceControlButtons();
+    return;
+  }
+
+  voiceSignalInboxRef = db.ref(`voiceSignals/${roomCode}/${mySeat}`);
+  voiceSignalHandler = snapshot => {
+    processVoiceSignal(snapshot).catch(error => {
+      console.warn("Signal voice gagal diproses.", error);
+    });
+  };
+  voiceSignalInboxRef.on("child_added", voiceSignalHandler);
+  syncVoicePeers(roomState);
+}
+
+async function stopVoiceChatNetwork() {
+  if (voiceSignalInboxRef && voiceSignalHandler) {
+    voiceSignalInboxRef.off("child_added", voiceSignalHandler);
+  }
+
+  try {
+    await voiceSignalInboxRef?.remove();
+  } catch (error) {
+    console.warn("Inbox signaling voice tidak dapat dibersihkan.", error);
+  }
+
+  Array.from(voicePeers.keys()).forEach(closeVoicePeer);
+  localVoiceStream?.getTracks?.().forEach(track => track.stop());
+  localVoiceStream = null;
+  localVoiceMicEnabled = false;
+  voiceNetworkStarted = false;
+  voiceSignalInboxRef = null;
+  voiceSignalHandler = null;
+  voiceSignalStartedAt = 0;
+  voiceToggleInProgress = false;
+}
+
 function createPlayerRow(seat) {
   const row = document.createElement("div");
   row.className = "player-row player-detail-trigger";
@@ -3960,7 +4538,22 @@ function createPlayerRow(seat) {
       <div class="money-change" data-role="money-change" aria-live="polite"></div>
     </div>
     <div class="owned-tags" data-role="owned"></div>
+    <button class="voice-control-button hidden" data-role="voice-control" type="button" aria-label="Voice chat"></button>
   `;
+  const voiceButton = row.querySelector('[data-role="voice-control"]');
+  voiceButton.addEventListener("pointerdown", event => event.stopPropagation());
+  voiceButton.addEventListener("touchstart", event => event.stopPropagation(), { passive: true });
+  voiceButton.addEventListener("keydown", event => event.stopPropagation());
+  voiceButton.addEventListener("click", async event => {
+    event.preventDefault();
+    event.stopPropagation();
+    const targetSeat = Number(row.dataset.seat);
+    if (targetSeat === Number(mySeat)) {
+      await toggleLocalMicrophone();
+    } else {
+      toggleRemoteSpeaker(targetSeat);
+    }
+  });
   row.addEventListener("click", () => showPlayerDetailPopup(Number(row.dataset.seat)));
   row.addEventListener("keydown", event => {
     if (event.key !== "Enter" && event.key !== " ") return;
@@ -4130,6 +4723,8 @@ function renderPlayersList(players) {
       const moneyState = queuePlayerMoneyChange(seat, player.money);
       setDisplayedPlayerMoney(seat, moneyState.displayed);
     }
+
+    updateVoiceControlButton(row, player, playerConnected);
   });
 
   if (shouldAnimateOrder) animatePlayerListReorder(previousRects);
@@ -5839,6 +6434,7 @@ async function leaveRoom() {
 
   updates[`players/${mySeat}/connected`] = false;
   updates[`players/${mySeat}/id`] = "";
+  updates[`players/${mySeat}/authUid`] = "";
   updates[`players/${mySeat}/inGame`] = false;
   updates[`players/${mySeat}/isHost`] = false;
   updates[`players/${mySeat}/disconnectedAt`] = firebase.database.ServerValue.TIMESTAMP;
@@ -5965,6 +6561,7 @@ async function leaveRoom() {
     }
   }
 
+  await stopVoiceChatNetwork();
   await detachCurrentPresence({ cancelDisconnect: true });
   await roomRef.update(updates);
 
@@ -5996,8 +6593,21 @@ async function leaveRoom() {
   els.leaveBtn.disabled = true;
 }
 
-els.createRoomBtn.addEventListener("click", createRoom);
-els.joinRoomBtn.addEventListener("click", joinRoom);
+function handleFirebaseClientError(error, actionLabel = "mengakses room") {
+  console.error(`Gagal ${actionLabel}.`, error);
+  const code = String(error?.code || error?.message || "");
+  const message = code.includes("PERMISSION_DENIED") || code.includes("permission-denied")
+    ? "Akses Firebase ditolak. Pastikan Anonymous Authentication aktif dan database.rules.json sudah di-deploy. Room lama tanpa authUid harus dibuat ulang."
+    : `Gagal ${actionLabel}. Periksa koneksi internet dan konfigurasi Firebase.`;
+  alert(message);
+}
+
+els.createRoomBtn.addEventListener("click", () => {
+  createRoom().catch(error => handleFirebaseClientError(error, "membuat room"));
+});
+els.joinRoomBtn.addEventListener("click", () => {
+  joinRoom().catch(error => handleFirebaseClientError(error, "bergabung ke room"));
+});
 els.startBtn.addEventListener("click", startGame);
 els.orderRollBtn?.addEventListener("click", handleOrderOverlayButton);
 window.chooseFreeMoveTarget = chooseFreeMoveTarget;
@@ -6027,6 +6637,21 @@ els.cardContinueBtn.addEventListener("click", closeCardAndFinishTurn);
 // Browser HP mengizinkan audio setelah interaksi pengguna pertama.
 document.addEventListener("pointerdown", unlockMoneyAudio, { passive: true });
 document.addEventListener("keydown", unlockMoneyAudio);
+document.addEventListener("pointerdown", unlockVoiceAudioPlayback, { passive: true });
+document.addEventListener("touchstart", unlockVoiceAudioPlayback, { passive: true });
+document.addEventListener("keydown", unlockVoiceAudioPlayback);
 
-initFirebase();
-restoreRoomSession();
+els.createRoomBtn.disabled = true;
+els.joinRoomBtn.disabled = true;
+
+firebaseReadyPromise = initFirebase();
+firebaseReadyPromise
+  .then(async () => {
+    els.createRoomBtn.disabled = false;
+    els.joinRoomBtn.disabled = false;
+    await restoreRoomSession();
+  })
+  .catch((error) => {
+    console.error("Firebase gagal diinisialisasi.", error);
+    alert("Firebase Authentication gagal. Pastikan Anonymous Authentication sudah diaktifkan di Firebase Console.");
+  });

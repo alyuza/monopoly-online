@@ -2737,3 +2737,91 @@ body.history-open {
     font-size: 12px;
   }
 }
+
+/* V15: voice chat controls pada Data Pemain. */
+.player-row {
+  position: relative;
+  padding-right: 54px;
+}
+
+.player-row .owned-tags {
+  padding-right: 38px;
+}
+
+.voice-control-button {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 12;
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 2px solid #111;
+  border-radius: 50%;
+  color: #111;
+  background: #e7d7aa;
+  box-shadow: 0 3px 0 rgba(20, 33, 61, .2);
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.voice-control-button svg {
+  width: 23px;
+  height: 23px;
+  display: block;
+  overflow: visible;
+}
+
+.voice-control-button.voice-on {
+  background: #e7d7aa;
+}
+
+.voice-control-button.voice-off {
+  background: #ff3b3b;
+}
+
+.voice-control-button.voice-offline,
+.voice-control-button:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+  filter: grayscale(.35);
+}
+
+.voice-control-button:focus-visible {
+  outline: 3px solid rgba(15, 107, 79, .55);
+  outline-offset: 2px;
+}
+
+.voice-remote-audio {
+  display: none !important;
+}
+
+@media (orientation: portrait) and (max-width: 700px) {
+  .player-row {
+    padding-right: 45px;
+  }
+
+  .player-row .owned-tags {
+    padding-right: 30px;
+  }
+
+  .voice-control-button {
+    right: 6px;
+    bottom: 6px;
+    width: 31px;
+    height: 31px;
+    min-width: 31px;
+    min-height: 31px;
+    border-width: 1.7px;
+  }
+
+  .voice-control-button svg {
+    width: 20px;
+    height: 20px;
+  }
+}
