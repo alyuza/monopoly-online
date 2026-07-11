@@ -7,6 +7,17 @@ const START_MONEY = 1500;
 const PASS_START_BONUS = 200;
 const RENT_LABELS = ["Tanah", "1R", "2R", "3R", "4R", "Hotel"];
 
+// Timeline visual roulette. Nilai game tetap dihitung sekali seperti sebelumnya;
+// konstanta ini hanya mengatur kapan hasil, pion, saldo, dan popup ditampilkan.
+const ROULETTE_SPIN_MS = 2500;
+const PAWN_START_AFTER_RESULT_MS = 1000;
+const PAWN_STEP_MS = 260;
+const PAWN_STEP_GAP_MS = 22;
+const EFFECTS_AFTER_ARRIVAL_MS = 1000;
+const DIRECT_PAWN_MOVE_MS = 760;
+const DISCONNECT_GRACE_MS = 30000;
+const PLAYER_PAYMENT_TOAST_MS = 5000;
+
 const PROPERTY_DATA = {
   "kuala-lumpur": { name: "Kuala Lumpur", kind: "city", group: "dark-bottom", color: "#28104d", mortgage: 30, rents: [5,20,60,180,320,450], buildingCost: 50 },
   "bangkok": { name: "Bangkok", kind: "city", group: "dark-bottom", color: "#28104d", mortgage: 30, rents: [5,20,60,180,320,450], buildingCost: 50 },
@@ -190,6 +201,21 @@ let localDismissedOrderResultId = "";
 let lastPlayerOrderSignature = "";
 let orderRollInProgress = false;
 let orderRollFinalizeTimer = null;
+let rouletteRevealTimer = null;
+let moveEffectsRevealTimer = null;
+let activeMoveResolutionTimer = null;
+let movePresentationUiMoveId = "";
+let movePresentationUiTimers = [];
+let disconnectExpiryTimer = null;
+let disconnectCountdownTimer = null;
+let disconnectCleanupInProgress = false;
+let localNetworkTimeoutTimer = null;
+let firebaseConnected = false;
+let membershipResetInProgress = false;
+let playerPaymentToastTimer = null;
+let playerPaymentToastId = "";
+let rouletteSoundTimers = [];
+let rouletteSoundId = "";
 
 const ROOM_SESSION_KEY = "atho_room_session";
 
@@ -200,6 +226,7 @@ let moneyAnimationGeneration = 0;
 let moneyAudioContext = null;
 
 const els = {
+  appRoot: document.getElementById("appRoot"),
   setupPanel: document.getElementById("setupPanel"),
   gamePanel: document.getElementById("gamePanel"),
   playerNameInput: document.getElementById("playerNameInput"),
@@ -227,6 +254,9 @@ const els = {
   disconnectOverlay: document.getElementById("disconnectOverlay"),
   disconnectTitle: document.getElementById("disconnectTitle"),
   disconnectText: document.getElementById("disconnectText"),
+  disconnectCountdown: document.getElementById("disconnectCountdown"),
+  disconnectLeaveBtn: document.getElementById("disconnectLeaveBtn"),
+  playerPaymentToast: document.getElementById("playerPaymentToast"),
   orderOverlay: document.getElementById("orderOverlay"),
   orderTitle: document.getElementById("orderTitle"),
   orderText: document.getElementById("orderText"),
@@ -307,6 +337,202 @@ function clearRoomSession() {
   localStorage.removeItem(ROOM_SESSION_KEY);
 }
 
+async function returnToSetupView(message = "") {
+  if (membershipResetInProgress) return;
+  membershipResetInProgress = true;
+
+  try {
+    if (disconnectExpiryTimer) clearTimeout(disconnectExpiryTimer);
+    if (disconnectCountdownTimer) clearInterval(disconnectCountdownTimer);
+    disconnectExpiryTimer = null;
+    disconnectCountdownTimer = null;
+
+    await detachCurrentPresence({ cancelDisconnect: firebaseConnected });
+    roomRef?.off();
+  } catch (error) {
+    console.warn("Gagal membersihkan koneksi room.", error);
+  }
+
+  resetLocalAnimationTimeline();
+  resetPlayerMoneyAnimations();
+  roomRef = null;
+  roomState = null;
+  roomCode = "";
+  mySeat = null;
+  clearRoomSession();
+
+  els.appRoot?.classList.remove("game-active");
+  els.setupPanel.classList.remove("hidden");
+  els.gamePanel.classList.add("hidden");
+  els.roomBadge.textContent = "Belum masuk room";
+  els.copyRoomBtn.disabled = true;
+  els.leaveBtn.disabled = true;
+  els.disconnectOverlay?.classList.add("hidden");
+
+  membershipResetInProgress = false;
+  if (message) setTimeout(() => alert(message), 80);
+}
+
+function isCurrentMembershipValid(stateLike = roomState) {
+  if (mySeat === null || !myPlayerId) return true;
+  return stateLike?.players?.[mySeat]?.id === myPlayerId;
+}
+
+function getDisconnectDeadline(player) {
+  const disconnectedAt = Number(player?.disconnectedAt || 0);
+  return disconnectedAt > 0 ? disconnectedAt + DISCONNECT_GRACE_MS : 0;
+}
+
+function getExpiredDisconnectedSeats(stateLike = roomState, now = Date.now()) {
+  return getDisconnectedRoomMembers(stateLike)
+    .filter(player => {
+      const deadline = getDisconnectDeadline(player);
+      return deadline > 0 && now >= deadline;
+    })
+    .map(player => Number(player.seat));
+}
+
+function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 30 detik") {
+  if (!room?.players?.[seat]) return room;
+
+  const leavingPlayer = room.players[seat];
+  const wasParticipant = isPlayerGameParticipant(leavingPlayer, room);
+  const originalOrder = getTurnOrderFromState(room);
+
+  leavingPlayer.connected = false;
+  leavingPlayer.id = "";
+  leavingPlayer.inGame = false;
+  leavingPlayer.isHost = false;
+  leavingPlayer.roulette12Streak = 0;
+  leavingPlayer.disconnectedAt = Date.now();
+  if (room.presence) room.presence[seat] = null;
+  room.turnOrder = normalizeSeatArray(room.turnOrder).filter(value => Number(value) !== Number(seat));
+
+  if (room.pendingExtraRoll && Number(room.pendingExtraRoll.seat) === Number(seat)) {
+    room.pendingExtraRoll = null;
+  }
+
+  if (room.status === "lobby") {
+    const candidates = Object.values(room.players || {})
+      .filter(player => player?.id && isMonopolyPlayer(player) && isPlayerConnectedInState(room, player))
+      .sort((a, b) => Number(a.seat) - Number(b.seat));
+    const newHostSeat = candidates.length ? Number(candidates[0].seat) : null;
+    room.hostSeat = newHostSeat;
+    Object.values(room.players || {}).forEach(player => {
+      player.isHost = newHostSeat !== null && Number(player.seat) === newHostSeat;
+    });
+  } else if (room.status === "orderRoll" && wasParticipant) {
+    const remaining = originalOrder
+      .filter(value => Number(value) !== Number(seat))
+      .filter(value => room.players?.[value]?.id);
+    room.status = "lobby";
+    room.orderRoll = null;
+    room.turnOrder = [];
+    room.isRolling = false;
+    room.pendingAction = null;
+    room.pendingExtraRoll = null;
+    room.currentSeat = remaining[0] ?? 0;
+    remaining.forEach(value => { room.players[value].inGame = false; });
+  } else if (room.status === "playing" && wasParticipant) {
+    const remaining = originalOrder
+      .filter(value => Number(value) !== Number(seat))
+      .filter(value => isPlayerGameParticipant(room.players?.[value], room));
+
+    if (remaining.length <= 1) {
+      const winnerSeat = remaining[0] ?? null;
+      room.status = "finished";
+      room.winnerSeat = winnerSeat;
+      room.currentSeat = winnerSeat;
+      room.isRolling = false;
+      room.pendingAction = null;
+      room.pendingExtraRoll = null;
+      room.debtState = null;
+      room.cardPopup = {
+        id: `${Date.now()}_disconnect_winner_${seat}`,
+        deckType: "system",
+        deck: "Game Selesai",
+        title: winnerSeat !== null ? `${room.players?.[winnerSeat]?.name || "Pemain terakhir"} Menang!` : "Game Selesai",
+        text: `${leavingPlayer.name || "Seorang pemain"} keluar karena tidak kembali dalam 30 detik.`,
+        seat: winnerSeat,
+        playerName: winnerSeat !== null ? room.players?.[winnerSeat]?.name : ""
+      };
+    } else {
+      if (Number(room.currentSeat) === Number(seat)) {
+        const leavingIndex = originalOrder.indexOf(Number(seat));
+        room.currentSeat = remaining[(Math.max(0, leavingIndex) % remaining.length)];
+      }
+      if (room.pendingAction && Number(room.pendingAction.seat) === Number(seat)) {
+        room.pendingAction = null;
+        room.isRolling = false;
+      }
+      if (room.debtState && Number(room.debtState.seat) === Number(seat)) {
+        room.debtState = null;
+        room.isRolling = false;
+      }
+      room.cardPopup = {
+        id: `${Date.now()}_disconnect_removed_${seat}`,
+        deckType: "system",
+        deck: "Info Game",
+        title: `${leavingPlayer.name || "Pemain"} Keluar`,
+        text: `Pemain dikeluarkan karena ${reasonText}. Permainan dilanjutkan.`,
+        seat,
+        playerName: leavingPlayer.name || "Pemain"
+      };
+    }
+  }
+
+  const connectedCandidates = Object.values(room.players || {})
+    .filter(player => player?.id && isMonopolyPlayer(player) && isPlayerConnectedInState(room, player))
+    .sort((a, b) => Number(a.seat) - Number(b.seat));
+  if (!room.players?.[room.hostSeat]?.id || !isPlayerConnectedInState(room, room.players?.[room.hostSeat])) {
+    room.hostSeat = connectedCandidates.length ? Number(connectedCandidates[0].seat) : null;
+    Object.values(room.players || {}).forEach(player => {
+      player.isHost = room.hostSeat !== null && Number(player.seat) === Number(room.hostSeat);
+    });
+  }
+
+  room.logs = room.logs || {};
+  room.logs[Date.now()] = `${leavingPlayer.name || "Pemain"} dikeluarkan karena terputus lebih dari 30 detik.`;
+  return room;
+}
+
+async function expireDisconnectedPlayers() {
+  if (!roomRef || disconnectCleanupInProgress) return;
+  disconnectCleanupInProgress = true;
+
+  try {
+    await roomRef.transaction(room => {
+      if (!room) return room;
+      const expiredSeats = getExpiredDisconnectedSeats(room, Date.now());
+      if (!expiredSeats.length) return;
+      expiredSeats.forEach(seat => removeSeatFromRoomState(room, seat));
+      return room;
+    });
+  } catch (error) {
+    console.warn("Gagal mengeluarkan pemain yang terputus.", error);
+  } finally {
+    disconnectCleanupInProgress = false;
+  }
+}
+
+function scheduleDisconnectExpiry(stateLike = roomState) {
+  if (disconnectExpiryTimer) clearTimeout(disconnectExpiryTimer);
+  disconnectExpiryTimer = null;
+
+  const deadlines = getDisconnectedRoomMembers(stateLike)
+    .map(getDisconnectDeadline)
+    .filter(value => value > 0)
+    .sort((a, b) => a - b);
+
+  if (!deadlines.length) return;
+
+  const delay = Math.max(80, deadlines[0] - Date.now() + 100);
+  disconnectExpiryTimer = setTimeout(() => {
+    disconnectExpiryTimer = null;
+    expireDisconnectedPlayers();
+  }, delay);
+}
+
 function getPresenceConnections(stateLike, seat) {
   const connections = stateLike?.presence?.[seat];
   if (!connections || typeof connections !== "object") return [];
@@ -371,6 +597,15 @@ function getDisconnectedGamePlayers(stateLike = roomState) {
     .sort((a, b) => Number(a.seat) - Number(b.seat));
 }
 
+function getDisconnectedRoomMembers(stateLike = roomState) {
+  if (!stateLike?.players) return [];
+
+  return Object.values(stateLike.players)
+    .filter(player => player?.id)
+    .filter(player => !isPlayerConnectedInState(stateLike, player))
+    .sort((a, b) => Number(a.seat) - Number(b.seat));
+}
+
 function isGamePausedForDisconnect(stateLike = roomState) {
   return getDisconnectedGamePlayers(stateLike).length > 0;
 }
@@ -412,6 +647,9 @@ async function detachCurrentPresence({ cancelDisconnect = true } = {}) {
     }
   }
 
+  if (localNetworkTimeoutTimer) clearTimeout(localNetworkTimeoutTimer);
+  localNetworkTimeoutTimer = null;
+  firebaseConnected = false;
   connectionInfoRef = null;
   connectionInfoHandler = null;
   playerPresenceRef = null;
@@ -429,7 +667,20 @@ async function setupCurrentPresence() {
   connectionInfoRef = db.ref(".info/connected");
 
   connectionInfoHandler = (snapshot) => {
-    if (snapshot.val() !== true) return;
+    const connected = snapshot.val() === true;
+    firebaseConnected = connected;
+
+    if (!connected) {
+      if (localNetworkTimeoutTimer) clearTimeout(localNetworkTimeoutTimer);
+      localNetworkTimeoutTimer = setTimeout(() => {
+        localNetworkTimeoutTimer = null;
+        returnToSetupView("Koneksi terputus lebih dari 30 detik. Silakan join room kembali.");
+      }, DISCONNECT_GRACE_MS);
+      return;
+    }
+
+    if (localNetworkTimeoutTimer) clearTimeout(localNetworkTimeoutTimer);
+    localNetworkTimeoutTimer = null;
     configureCurrentPresence().catch(error => {
       console.warn("Gagal memperbarui presence pemain.", error);
     });
@@ -691,6 +942,8 @@ async function joinRoom() {
 }
 
 function enterGameView() {
+  els.appRoot?.classList.add("game-active");
+  resetLocalAnimationTimeline();
   resetPlayerMoneyAnimations();
   els.setupPanel.classList.add("hidden");
   els.gamePanel.classList.remove("hidden");
@@ -709,12 +962,17 @@ function subscribeRoom() {
   roomRef.on("value", (snap) => {
     roomState = snap.val();
     if (!roomState) {
-      clearRoomSession();
-      renderDisconnectOverlay();
+      returnToSetupView("Room sudah tidak tersedia.");
+      return;
+    }
+
+    if (!isCurrentMembershipValid(roomState)) {
+      returnToSetupView("Koneksi melewati batas 30 detik atau kamu sudah keluar dari room. Silakan buat atau join room kembali.");
       return;
     }
 
     ensureLobbyHost(roomState);
+    scheduleDisconnectExpiry(roomState);
 
     if (!roomState.propertyState) {
       roomRef.child("propertyState").set(makeInitialPropertyState());
@@ -728,6 +986,8 @@ function subscribeRoom() {
     }
 
     maybeAnimateLastMove();
+    scheduleMovePresentationUi(roomState);
+    scheduleActiveMoveResolution(roomState);
     scheduleStartingOrderFinalization(roomState);
   });
 }
@@ -1052,7 +1312,7 @@ function scheduleStartingOrderFinalization(stateLike = roomState) {
     || !roulette?.id) return;
 
   const elapsed = Date.now() - Number(roulette.createdAt || Date.now());
-  const delay = Math.max(80, 1800 - elapsed);
+  const delay = Math.max(80, (ROULETTE_SPIN_MS + 120) - elapsed);
   orderRollFinalizeTimer = setTimeout(() => {
     orderRollFinalizeTimer = null;
     finalizeStartingOrderRoll(roulette.id).catch(error => {
@@ -1150,6 +1410,169 @@ function getRouletteFinalRotation(previousRotation, result, fullTurns = 5) {
   return currentRotation + (360 * fullTurns) + alignmentDelta;
 }
 
+function getPawnStepArrivalOffset(stepNumber) {
+  const step = Math.max(0, Number(stepNumber || 0));
+  if (!step) return 0;
+  return (step * PAWN_STEP_MS) + (Math.max(0, step - 1) * PAWN_STEP_GAP_MS);
+}
+
+function getPawnMoveDuration(steps) {
+  return getPawnStepArrivalOffset(Math.max(0, Number(steps || 0)));
+}
+
+function makeRouletteMovePresentation(createdAt, from, steps, passedStart = false, directDuration = 0) {
+  const startedAt = Number(createdAt || Date.now());
+  const normalizedSteps = Math.max(0, Number(steps || 0));
+  const rouletteRevealAt = startedAt + ROULETTE_SPIN_MS;
+  const pawnStartAt = rouletteRevealAt + PAWN_START_AFTER_RESULT_MS;
+  const moveDuration = directDuration > 0
+    ? Math.max(220, Number(directDuration))
+    : getPawnMoveDuration(normalizedSteps);
+  const arrivalAt = pawnStartAt + moveDuration;
+  const effectsRevealAt = arrivalAt + EFFECTS_AFTER_ARRIVAL_MS;
+  const normalizedFrom = ((Number(from || 0) % BOARD_SIZE) + BOARD_SIZE) % BOARD_SIZE;
+  const startStep = passedStart ? BOARD_SIZE - normalizedFrom : 0;
+  const startBonusAt = passedStart
+    ? pawnStartAt + getPawnStepArrivalOffset(startStep)
+    : 0;
+
+  return {
+    type: "roulette",
+    rouletteRevealAt,
+    pawnStartAt,
+    arrivalAt,
+    effectsRevealAt,
+    startBonusAt,
+    moveDuration
+  };
+}
+
+function getMovePresentation(move = roomState?.lastMove) {
+  return move?.presentation || null;
+}
+
+function getCurrentMoveEffectsRevealAt() {
+  return Number(getMovePresentation()?.effectsRevealAt || 0);
+}
+
+function getCurrentMovePresentationPhase(now = Date.now()) {
+  const move = roomState?.lastMove;
+  const presentation = getMovePresentation(move);
+  const isCurrentRouletteMove = Boolean(move?.id && roomState?.lastRoulette?.id === move.id);
+  if (!isCurrentRouletteMove || !presentation || presentation.type !== "roulette") return "none";
+  if (now < Number(presentation.rouletteRevealAt || 0)) return "roulette";
+  if (now < Number(presentation.pawnStartAt || 0)) return "result";
+  if (now < Number(presentation.arrivalAt || 0)) return "moving";
+  if (now < Number(presentation.effectsRevealAt || 0)) return "arrived";
+  return "done";
+}
+
+function resetLocalAnimationTimeline() {
+  if (rouletteRevealTimer) clearTimeout(rouletteRevealTimer);
+  if (moveEffectsRevealTimer) clearTimeout(moveEffectsRevealTimer);
+  if (activeMoveResolutionTimer) clearTimeout(activeMoveResolutionTimer);
+  movePresentationUiTimers.forEach(timer => clearTimeout(timer));
+  movePresentationUiTimers = [];
+  movePresentationUiMoveId = "";
+  rouletteRevealTimer = null;
+  moveEffectsRevealTimer = null;
+  activeMoveResolutionTimer = null;
+  lastAnimatedMoveId = "";
+  lastRouletteId = "";
+}
+
+function scheduleMoveEffectsRender(revealAt) {
+  const target = Number(revealAt || 0);
+  if (!target || target <= Date.now()) return;
+
+  if (moveEffectsRevealTimer) clearTimeout(moveEffectsRevealTimer);
+  moveEffectsRevealTimer = setTimeout(() => {
+    moveEffectsRevealTimer = null;
+    if (roomState) renderUI();
+  }, Math.max(20, target - Date.now() + 20));
+}
+
+function scheduleMovePresentationUi(stateLike = roomState) {
+  const move = stateLike?.lastMove;
+  const presentation = getMovePresentation(move);
+  if (!move?.id || !presentation || presentation.type !== "roulette") return;
+  if (movePresentationUiMoveId === move.id) return;
+
+  movePresentationUiTimers.forEach(timer => clearTimeout(timer));
+  movePresentationUiTimers = [];
+  movePresentationUiMoveId = move.id;
+
+  const boundaries = [
+    presentation.rouletteRevealAt,
+    presentation.pawnStartAt,
+    presentation.arrivalAt,
+    presentation.effectsRevealAt
+  ].map(Number).filter(value => value > Date.now());
+
+  boundaries.forEach(boundary => {
+    const timer = setTimeout(() => {
+      if (roomState?.lastMove?.id === move.id) renderUI();
+    }, Math.max(20, boundary - Date.now() + 20));
+    movePresentationUiTimers.push(timer);
+  });
+}
+
+async function finalizeActiveMovePresentation(moveId, seat) {
+  if (!roomRef) return;
+
+  const latest = (await roomRef.once("value")).val();
+  if (!latest?.lastMove || latest.lastMove.id !== moveId || !latest.isRolling) return;
+  if (Number(latest.lastMove.seat) !== Number(seat)) return;
+
+  const latestPlayer = latest.players?.[seat];
+
+  if (latest.debtState && Number(latest.debtState.seat) === Number(seat)) {
+    await roomRef.update({ isRolling: false });
+    return;
+  }
+
+  if (latestPlayer?.bankrupt) {
+    await roomRef.update({ isRolling: false });
+    await finishTurn();
+    return;
+  }
+
+  if (latest.pendingAction) {
+    await roomRef.update({ isRolling: false });
+    return;
+  }
+
+  await roomRef.update({ isRolling: false });
+  await finishTurn();
+}
+
+function scheduleActiveMoveResolution(stateLike = roomState) {
+  const move = stateLike?.lastMove;
+  const presentation = getMovePresentation(move);
+
+  if (activeMoveResolutionTimer) {
+    clearTimeout(activeMoveResolutionTimer);
+    activeMoveResolutionTimer = null;
+  }
+
+  if (!roomRef
+    || stateLike?.status !== "playing"
+    || !stateLike?.isRolling
+    || !move?.id
+    || !presentation?.effectsRevealAt
+    || Number(move.seat) !== Number(mySeat)) {
+    return;
+  }
+
+  const delay = Math.max(80, Number(presentation.effectsRevealAt) - Date.now());
+  activeMoveResolutionTimer = setTimeout(() => {
+    activeMoveResolutionTimer = null;
+    finalizeActiveMovePresentation(move.id, Number(move.seat)).catch(error => {
+      console.error("Gagal menyelesaikan timeline animasi pion.", error);
+    });
+  }, delay);
+}
+
 function makeRoulette12BonusPopup(player, streak) {
   const isSecond = Number(streak) >= 2;
 
@@ -1245,14 +1668,19 @@ async function rollDice() {
   const nextStreak = result === 12 ? currentStreak + 1 : 0;
   const isThirdConsecutiveTwelve = result === 12 && nextStreak >= 3;
   const from = Number(player.position || 0);
-  const moveId = `${Date.now()}_${mySeat}_${Math.random().toString(16).slice(2)}`;
+  const createdAt = Date.now();
+  const moveId = `${createdAt}_${mySeat}_${Math.random().toString(16).slice(2)}`;
   const prevRotation = Number(roomState.lastRoulette?.rotation || 0);
   const rotation = getRouletteFinalRotation(prevRotation, result);
 
   // Angka 12 ketiga tidak menjalankan perpindahan normal. Pemain langsung
   // dipindahkan ke penjara dan rantai roulette 12 di-reset.
   if (isThirdConsecutiveTwelve) {
-    const popup = makeTripleTwelveJailPopup(player);
+    const presentation = makeRouletteMovePresentation(createdAt, from, 0, false, DIRECT_PAWN_MOVE_MS);
+    const popup = {
+      ...makeTripleTwelveJailPopup(player),
+      revealAt: presentation.effectsRevealAt
+    };
     const updates = {
       isRolling: true,
       lastDice: [0, result],
@@ -1260,7 +1688,8 @@ async function rollDice() {
         id: moveId,
         result,
         rotation,
-        createdAt: Date.now(),
+        createdAt,
+        revealAt: presentation.rouletteRevealAt,
         source: "triple-roulette-12"
       },
       lastMove: {
@@ -1270,15 +1699,17 @@ async function rollDice() {
         to: 10,
         steps: 0,
         direct: true,
-        duration: 760,
-        createdAt: Date.now()
+        duration: DIRECT_PAWN_MOVE_MS,
+        presentation,
+        createdAt
       },
       pendingExtraRoll: null,
       pendingAction: {
         type: "tripleTwelveJail",
         seat: mySeat,
         streak: 3,
-        moveId
+        moveId,
+        revealAt: presentation.effectsRevealAt
       },
       cardPopup: popup
     };
@@ -1291,11 +1722,11 @@ async function rollDice() {
     await roomRef.update(updates);
     await addRemoteLog(`${player.name} mendapat roulette 12 tiga kali berturut-turut dan masuk penjara.`);
 
-    setTimeout(async () => {
-      const latest = (await roomRef.once("value")).val();
-      if (!latest?.lastRoulette || latest.lastRoulette.id !== moveId) return;
-      await roomRef.update({ isRolling: false });
-    }, 1650);
+    scheduleActiveMoveResolution({
+      status: "playing",
+      isRolling: true,
+      lastMove: updates.lastMove
+    });
     return;
   }
 
@@ -1306,6 +1737,7 @@ async function rollDice() {
   const nextLaps = previousLaps + (passedStart ? 1 : 0);
   const boardActiveAfterMove = previousLaps >= 1 || passedStart;
   const completedFirstLap = previousLaps < 1 && passedStart;
+  const presentation = makeRouletteMovePresentation(createdAt, from, total, passedStart);
 
   let playerMoney = Number(player.money || 0) + (passedStart ? PASS_START_BONUS : 0);
   const updates = {
@@ -1315,7 +1747,8 @@ async function rollDice() {
       id: moveId,
       result,
       rotation,
-      createdAt: Date.now()
+      createdAt,
+      revealAt: presentation.rouletteRevealAt
     },
     lastMove: {
       id: moveId,
@@ -1324,7 +1757,10 @@ async function rollDice() {
       to,
       steps: total,
       dice: [0, result],
-      createdAt: Date.now()
+      passedStart,
+      startBonus: passedStart ? PASS_START_BONUS : 0,
+      presentation,
+      createdAt
     },
     pendingAction: null,
     pendingExtraRoll: result === 12
@@ -1332,7 +1768,7 @@ async function rollDice() {
           seat: mySeat,
           streak: nextStreak,
           moveId,
-          createdAt: Date.now()
+          createdAt
         }
       : null
   };
@@ -1360,38 +1796,43 @@ async function rollDice() {
     playerMoney = applyLandingEffect(to, mySeat, playerMoney, total, updates, logs);
   }
 
+  // State efek petak tetap dihitung dalam satu transaksi Firebase, tetapi UI
+  // baru memperlihatkannya satu detik setelah pion tiba.
+  if (updates.cardPopup) {
+    updates.cardPopup = {
+      ...updates.cardPopup,
+      revealAt: presentation.effectsRevealAt
+    };
+  }
+  if (updates.pendingAction) {
+    updates.pendingAction = {
+      ...updates.pendingAction,
+      revealAt: presentation.effectsRevealAt
+    };
+  }
+  if (updates.debtState) {
+    updates.debtState = {
+      ...updates.debtState,
+      revealAt: presentation.effectsRevealAt
+    };
+  }
+  if (updates.playerPaymentNotice) {
+    updates.playerPaymentNotice = {
+      ...updates.playerPaymentNotice,
+      revealAt: presentation.effectsRevealAt
+    };
+  }
+
   updates[`players/${mySeat}/money`] = playerMoney;
 
   await roomRef.update(updates);
   await addLogs(logs);
 
-  const animationMs = Math.min(5200, total * 280 + 1700);
-
-  setTimeout(async () => {
-    const latest = (await roomRef.once("value")).val();
-    if (!latest?.lastMove || latest.lastMove.id !== moveId) return;
-
-    const latestPlayer = latest.players?.[mySeat];
-
-    if (latest.debtState && Number(latest.debtState.seat) === Number(mySeat)) {
-      await roomRef.update({ isRolling: false });
-      return;
-    }
-
-    if (latestPlayer?.bankrupt) {
-      await roomRef.update({ isRolling: false });
-      await finishTurn();
-      return;
-    }
-
-    if (latest.pendingAction) {
-      await roomRef.update({ isRolling: false });
-      return;
-    }
-
-    await roomRef.update({ isRolling: false });
-    await finishTurn();
-  }, animationMs);
+  scheduleActiveMoveResolution({
+    status: "playing",
+    isRolling: true,
+    lastMove: updates.lastMove
+  });
 }
 
 
@@ -1410,9 +1851,26 @@ function applyLandingEffect(tileIndex, seat, playerMoney, diceTotal, updates, lo
   }
 
   if (tile.type === "go-jail") {
+    const popupId = `${Date.now()}_${seat}_go_jail_${Math.random().toString(16).slice(2)}`;
     updates[`players/${seat}/position`] = 10;
     updates[`players/${seat}/inJail`] = true;
     updates[`players/${seat}/jailAttempts`] = 0;
+    updates[`players/${seat}/roulette12Streak`] = 0;
+    updates.pendingExtraRoll = null;
+    updates.cardPopup = {
+      id: popupId,
+      deckType: "system",
+      deck: "Penjara",
+      title: "MASUK PENJARA!",
+      text: `${player.name} berhenti di petak Masuk Penjara dan langsung dipindahkan ke Penjara.`,
+      seat,
+      playerName: player.name
+    };
+    updates.pendingAction = {
+      type: "goJailPopup",
+      seat,
+      cardId: popupId
+    };
     logs.push(`${player.name} masuk penjara.`);
     return playerMoney;
   }
@@ -1847,6 +2305,14 @@ function handlePropertyLanding(propertyId, seat, playerMoney, diceTotal, updates
   playerMoney -= rent;
   const ownerMoney = Number(owner.money || 0) + rent;
   updates[`players/${ownerSeat}/money`] = ownerMoney;
+  updates.playerPaymentNotice = {
+    id: `${Date.now()}_${seat}_${ownerSeat}_${rent}_${Math.random().toString(16).slice(2)}`,
+    payerSeat: Number(seat),
+    receiverSeat: ownerSeat,
+    amount: rent,
+    text: `${player.name} membayar ${owner.name} ${formatMoney(rent)}`,
+    createdAt: Date.now()
+  };
 
   logs.push(`${player.name} membayar sewa ${formatMoney(rent)} kepada ${owner.name} untuk ${property.name}.`);
   return applyDebtRequirement(seat, playerMoney, updates, `sewa ${property.name} sebesar ${formatMoney(rent)}`, logs);
@@ -1887,7 +2353,10 @@ function calculateRent(propertyId, diceTotal = 7, stateLike = roomState) {
     let rent = property.rents[Number(ps.level || 0)] || property.rents[0];
 
     if (hasFullGroup(ps.owner, property.group, stateLike)) {
-      rent *= 2;
+      // Tarif kompleks pada popup sudah menampilkan tarif dasar kompleks (×2).
+      // Saat pemain benar-benar memiliki seluruh kompleks, sewa efektif kembali
+      // dikalikan 2. Contoh Moscow: $23 → tarif kompleks $46 → sewa efektif $92.
+      rent *= 4;
     }
 
     return rent;
@@ -2142,7 +2611,7 @@ async function rollForJailRoulette() {
     });
     await addRemoteLog(`${latestPlayer.name} gagal keluar dari penjara karena roulette mendapat angka ${result}. Percobaan ${attempts}/3.`);
     await finishTurn();
-  }, 1650);
+  }, ROULETTE_SPIN_MS + 120);
 }
 
 async function buyCurrentProperty() {
@@ -2335,9 +2804,22 @@ function renderUI() {
   } else if (me?.bankrupt) {
     els.statusText.textContent = "Kamu sudah bangkrut dan sekarang menjadi penonton. Permainan pemain lain tetap berlanjut.";
   } else if (roomState.isRolling) {
-    els.statusText.textContent = current?.inJail
-      ? "Roulette penjara sedang berputar. Pemain harus mendapat angka 12 untuk bebas."
-      : "Pion sedang berjalan. Tunggu sampai animasi selesai.";
+    const phase = getCurrentMovePresentationPhase();
+    if (roomState?.lastRoulette?.source === "jail") {
+      els.statusText.textContent = "Roulette penjara sedang berputar. Pemain harus mendapat angka 12 untuk bebas.";
+    } else if (phase === "roulette") {
+      els.statusText.textContent = "Roulette sedang berputar. Hasil akan muncul setelah putaran selesai.";
+    } else if (phase === "result") {
+      els.statusText.textContent = "Hasil roulette sudah keluar. Pion akan mulai bergerak dalam 1 detik.";
+    } else if (phase === "moving") {
+      els.statusText.textContent = "Pion sedang bergerak menuju petak tujuan.";
+    } else if (phase === "arrived") {
+      els.statusText.textContent = "Pion sudah tiba. Menyiapkan efek petak...";
+    } else if (phase === "none") {
+      els.statusText.textContent = "Pion sedang bergerak. Tunggu sampai proses selesai.";
+    } else {
+      els.statusText.textContent = "Tunggu sampai proses giliran selesai.";
+    }
   } else if (roomState.pendingAction) {
     const actor = players[roomState.pendingAction.seat];
     if (roomState.pendingAction.type === "freeParkingChoice") {
@@ -2354,6 +2836,8 @@ function renderUI() {
         : `${actor?.name || "Pemain aktif"} mendapat bonus roulette karena memperoleh angka 12.`;
     } else if (roomState.pendingAction.type === "tripleTwelveJail") {
       els.statusText.textContent = `${actor?.name || "Pemain aktif"} mendapat angka 12 tiga kali berturut-turut dan masuk penjara.`;
+    } else if (roomState.pendingAction.type === "goJailPopup") {
+      els.statusText.textContent = `${actor?.name || "Pemain aktif"} berhenti di petak Masuk Penjara dan dipindahkan ke Penjara.`;
     } else {
       els.statusText.textContent = `Menunggu aksi dari ${actor?.name || "pemain aktif"}.`;
     }
@@ -2378,6 +2862,7 @@ function renderUI() {
   renderPlayersList(players);
   renderLogs();
   renderCardPopup();
+  renderPlayerPaymentToast();
   renderDisconnectOverlay();
   renderOrderOverlay();
 }
@@ -2466,20 +2951,53 @@ function renderDisconnectOverlay() {
   els.disconnectOverlay.classList.toggle("hidden", !shouldShow);
   els.disconnectOverlay.setAttribute("aria-hidden", shouldShow ? "false" : "true");
 
-  if (!shouldShow) return;
-
-  const names = disconnectedPlayers.map(player => player.name || `Pemain ${Number(player.seat) + 1}`);
-  const nameText = names.length === 1
-    ? names[0]
-    : `${names.slice(0, -1).join(", ")} dan ${names[names.length - 1]}`;
-
-  if (els.disconnectTitle) {
-    els.disconnectTitle.textContent = "Permainan Dijeda";
+  if (!shouldShow) {
+    if (disconnectCountdownTimer) clearInterval(disconnectCountdownTimer);
+    disconnectCountdownTimer = null;
+    return;
   }
 
-  if (els.disconnectText) {
-    els.disconnectText.textContent = `Menunggu ${nameText} terhubung kembali. Permainan akan dilanjutkan otomatis setelah koneksi pulih.`;
+  const renderCountdown = () => {
+    if (!roomState) return;
+    const currentDisconnected = getDisconnectedGamePlayers(roomState);
+    if (!currentDisconnected.length) return;
+
+    const names = currentDisconnected.map(player => player.name || `Pemain ${Number(player.seat) + 1}`);
+    const nameText = names.length === 1
+      ? names[0]
+      : `${names.slice(0, -1).join(", ")} dan ${names[names.length - 1]}`;
+    const remainingValues = currentDisconnected
+      .map(getDisconnectDeadline)
+      .filter(deadline => deadline > 0)
+      .map(deadline => Math.max(0, deadline - Date.now()))
+      .filter(value => Number.isFinite(value));
+    const remainingMs = remainingValues.length ? Math.min(...remainingValues) : DISCONNECT_GRACE_MS;
+    const remainingSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+
+    if (els.disconnectTitle) els.disconnectTitle.textContent = "Permainan Dijeda";
+    if (els.disconnectText) {
+      els.disconnectText.textContent = `Menunggu ${nameText} terhubung kembali. Jika tidak kembali, pemain akan dikeluarkan otomatis.`;
+    }
+    if (els.disconnectCountdown) {
+      els.disconnectCountdown.textContent = `${remainingSeconds} detik`;
+    }
+  };
+
+  renderCountdown();
+  if (!disconnectCountdownTimer) {
+    disconnectCountdownTimer = setInterval(() => {
+      renderCountdown();
+      expireDisconnectedPlayers();
+    }, 1000);
   }
+}
+
+async function handleDisconnectLeave() {
+  if (!roomRef || mySeat === null) {
+    await returnToSetupView();
+    return;
+  }
+  await leaveRoom();
 }
 
 function renderActionPanel() {
@@ -2577,15 +3095,38 @@ function renderActionPanel() {
   }
 
   if (roomState.isRolling) {
-    els.actionPanel.innerHTML = player?.inJail
-      ? `
+    const phase = getCurrentMovePresentationPhase();
+    if (roomState?.lastRoulette?.source === "jail") {
+      els.actionPanel.innerHTML = `
         <div class="action-title">Roulette Penjara</div>
         <div class="action-sub">Roulette sedang berputar. Angka 12 akan membebaskan pemain tanpa membayar.</div>
-      `
-      : `
-        <div class="action-title">Pion Bergerak</div>
-        <div class="action-sub">Tunggu animasi pion selesai. Setelah itu aksi petak akan muncul jika tersedia.</div>
       `;
+    } else if (phase === "roulette") {
+      els.actionPanel.innerHTML = `
+        <div class="action-title">Roulette Berputar</div>
+        <div class="action-sub">Hasil masih disembunyikan sampai animasi roulette selesai.</div>
+      `;
+    } else if (phase === "result") {
+      els.actionPanel.innerHTML = `
+        <div class="action-title">Hasil Roulette</div>
+        <div class="action-sub">Pion akan mulai bergerak satu detik setelah hasil muncul.</div>
+      `;
+    } else if (phase === "moving") {
+      els.actionPanel.innerHTML = `
+        <div class="action-title">Pion Bergerak</div>
+        <div class="action-sub">Tunggu pion sampai benar-benar tiba di petak tujuan.</div>
+      `;
+    } else if (phase === "arrived" || phase === "done") {
+      els.actionPanel.innerHTML = `
+        <div class="action-title">Memproses Petak</div>
+        <div class="action-sub">Pion sudah tiba. Efek petak akan muncul sesaat lagi.</div>
+      `;
+    } else {
+      els.actionPanel.innerHTML = `
+        <div class="action-title">Pion Bergerak</div>
+        <div class="action-sub">Tunggu pion sampai proses perpindahan selesai.</div>
+      `;
+    }
     return;
   }
 
@@ -2624,6 +3165,17 @@ function renderActionPanel() {
     els.actionPanel.innerHTML = `
       <div class="action-title">MASUK PENJARA</div>
       <div class="action-sub">${escapeHTML(actor?.name || "Pemain aktif")} mendapat angka 12 tiga kali berturut-turut dan langsung dipindahkan ke penjara.</div>
+      <div class="action-row single">
+        <button class="primary" onclick="closeCardAndFinishTurn()" ${enabled ? "" : "disabled"}>Tutup & Lanjutkan</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (action.type === "goJailPopup") {
+    els.actionPanel.innerHTML = `
+      <div class="action-title">MASUK PENJARA</div>
+      <div class="action-sub">${escapeHTML(actor?.name || "Pemain aktif")} berhenti di petak Masuk Penjara dan dipindahkan ke Penjara.</div>
       <div class="action-row single">
         <button class="primary" onclick="closeCardAndFinishTurn()" ${enabled ? "" : "disabled"}>Tutup & Lanjutkan</button>
       </div>
@@ -2721,21 +3273,53 @@ function renderActionPanel() {
 function renderRouletteUI() {
   const roulette = roomState?.lastRoulette || { result: 0, rotation: 0, id: "" };
   const result = Number(roulette.result || 0);
+  const revealAt = Number(roulette.revealAt || (Number(roulette.createdAt || 0) + ROULETTE_SPIN_MS));
+  const isWaitingForResult = Boolean(roulette.id && result && Date.now() < revealAt);
 
-  if (els.rouletteResult) els.rouletteResult.textContent = result || "-";
-  if (els.rouletteCaption) els.rouletteCaption.textContent = result || "-";
+  const showResult = () => {
+    if (roomState?.lastRoulette?.id !== roulette.id) return;
+    if (els.rouletteResult) els.rouletteResult.textContent = result || "-";
+    if (els.rouletteCaption) els.rouletteCaption.textContent = result || "-";
+  };
+
+  if (isWaitingForResult) {
+    if (els.rouletteResult) els.rouletteResult.textContent = "";
+    if (els.rouletteCaption) els.rouletteCaption.textContent = "-";
+  } else {
+    showResult();
+  }
 
   if (!els.rouletteWheel) return;
 
   if (roulette.id && roulette.id !== lastRouletteId) {
     lastRouletteId = roulette.id;
-    els.rouletteWheel.style.transition = "transform 1.55s cubic-bezier(.12,.72,.14,1)";
-    requestAnimationFrame(() => {
+    if (rouletteRevealTimer) clearTimeout(rouletteRevealTimer);
+
+    const elapsed = Math.max(0, Date.now() - Number(roulette.createdAt || Date.now()));
+    const remainingSpin = Math.max(0, ROULETTE_SPIN_MS - elapsed);
+
+    if (remainingSpin > 30) {
+      playRouletteSpinSound(roulette.id, remainingSpin);
+      els.rouletteWheel.style.transition = `transform ${remainingSpin}ms cubic-bezier(.12,.72,.14,1)`;
+      requestAnimationFrame(() => {
+        els.rouletteWheel.style.transform = `rotate(${Number(roulette.rotation || 0)}deg)`;
+      });
+
+      rouletteRevealTimer = setTimeout(() => {
+        rouletteRevealTimer = null;
+        showResult();
+      }, Math.max(20, revealAt - Date.now()));
+    } else {
+      els.rouletteWheel.style.transition = "none";
       els.rouletteWheel.style.transform = `rotate(${Number(roulette.rotation || 0)}deg)`;
-    });
+      showResult();
+    }
   } else {
-    els.rouletteWheel.style.transition = "none";
-    els.rouletteWheel.style.transform = `rotate(${Number(roulette.rotation || 0)}deg)`;
+    // Snapshot Firebase tambahan tidak boleh memulai ulang animasi roulette.
+    if (!isWaitingForResult) {
+      els.rouletteWheel.style.transition = "none";
+      els.rouletteWheel.style.transform = `rotate(${Number(roulette.rotation || 0)}deg)`;
+    }
   }
 }
 
@@ -2804,6 +3388,44 @@ function unlockMoneyAudio() {
   }
 }
 
+function clearRouletteSpinSound() {
+  rouletteSoundTimers.forEach(timer => clearTimeout(timer));
+  rouletteSoundTimers = [];
+}
+
+function playRouletteSpinSound(soundId, durationMs = ROULETTE_SPIN_MS) {
+  if (!soundId || rouletteSoundId === soundId) return;
+  rouletteSoundId = soundId;
+  clearRouletteSpinSound();
+
+  const audioContext = unlockMoneyAudio();
+  if (!audioContext || audioContext.state !== "running") return;
+
+  const duration = Math.max(300, Number(durationMs || ROULETTE_SPIN_MS));
+  const ticks = 22;
+
+  for (let index = 0; index < ticks; index++) {
+    const progress = index / Math.max(1, ticks - 1);
+    const easedProgress = 1 - Math.pow(1 - progress, 1.7);
+    const delay = Math.round(easedProgress * Math.max(0, duration - 80));
+    const timer = setTimeout(() => {
+      const now = audioContext.currentTime;
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      oscillator.type = "square";
+      oscillator.frequency.setValueAtTime(760 + (progress * 260), now);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.025, now + 0.003);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.035);
+      oscillator.connect(gain);
+      gain.connect(audioContext.destination);
+      oscillator.start(now);
+      oscillator.stop(now + 0.045);
+    }, delay);
+    rouletteSoundTimers.push(timer);
+  }
+}
+
 function playMoneyChangeSound(delta) {
   const audioContext = unlockMoneyAudio();
   if (!audioContext || audioContext.state !== "running") return;
@@ -2843,6 +3465,57 @@ function playMoneyChangeSound(delta) {
   });
 }
 
+function buildTimedMoneyChanges(seat, fromMoney, toMoney, state) {
+  const from = Number(fromMoney || 0);
+  const to = Number(toMoney || 0);
+  const move = roomState?.lastMove;
+  const presentation = getMovePresentation(move);
+  const isFreshRouletteMove = Boolean(
+    roomState?.isRolling
+    && move?.id
+    && presentation?.type === "roulette"
+    && state.lastMoveMoneyId !== move.id
+  );
+
+  if (!isFreshRouletteMove) {
+    return [{ from, to, delta: to - from, notBefore: 0 }];
+  }
+
+  state.lastMoveMoneyId = move.id;
+  const effectAt = Number(presentation.effectsRevealAt || 0);
+
+  // Bonus START ditampilkan tepat ketika pion mencapai petak START. Jika pada
+  // langkah yang sama ada sewa/pajak/kartu, perubahan sisanya baru tampil
+  // setelah pion tiba di tujuan dan jeda efek selesai.
+  if (Number(move.seat) === Number(seat) && move.passedStart && Number(move.startBonus || 0) > 0) {
+    const bonus = Number(move.startBonus || PASS_START_BONUS);
+    const afterStart = from + bonus;
+    const changes = [{
+      from,
+      to: afterStart,
+      delta: bonus,
+      notBefore: Number(presentation.startBonusAt || presentation.pawnStartAt || 0)
+    }];
+
+    if (afterStart !== to) {
+      changes.push({
+        from: afterStart,
+        to,
+        delta: to - afterStart,
+        notBefore: effectAt
+      });
+    }
+    return changes;
+  }
+
+  return [{
+    from,
+    to,
+    delta: to - from,
+    notBefore: effectAt
+  }];
+}
+
 function queuePlayerMoneyChange(seat, nextMoney) {
   const normalizedSeat = Number(seat);
   const normalizedMoney = Number(nextMoney || 0);
@@ -2855,18 +3528,16 @@ function queuePlayerMoneyChange(seat, nextMoney) {
       queue: [],
       running: false,
       activeDelta: 0,
-      settleTimer: null
+      settleTimer: null,
+      lastMoveMoneyId: ""
     };
     playerMoneyAnimationStates.set(normalizedSeat, state);
     return state;
   }
 
   if (normalizedMoney !== state.observed) {
-    state.queue.push({
-      from: state.observed,
-      to: normalizedMoney,
-      delta: normalizedMoney - state.observed
-    });
+    const changes = buildTimedMoneyChanges(normalizedSeat, state.observed, normalizedMoney, state);
+    state.queue.push(...changes.filter(change => Number(change.delta || 0) !== 0));
     state.observed = normalizedMoney;
     runPlayerMoneyAnimationQueue(normalizedSeat);
   }
@@ -2883,6 +3554,13 @@ async function runPlayerMoneyAnimationQueue(seat) {
 
   while (state.queue.length && generation === moneyAnimationGeneration) {
     const changeData = state.queue.shift();
+    const waitUntil = Number(changeData.notBefore || 0);
+    const waitMs = Math.max(0, waitUntil - Date.now());
+    if (waitMs > 0) {
+      await waitForMoneyAnimation(waitMs);
+      if (generation !== moneyAnimationGeneration) return;
+    }
+
     const delta = Number(changeData.delta || 0);
 
     if (!delta) {
@@ -2927,8 +3605,11 @@ async function runPlayerMoneyAnimationQueue(seat) {
 
 function createPlayerRow(seat) {
   const row = document.createElement("div");
-  row.className = "player-row";
+  row.className = "player-row player-detail-trigger";
   row.dataset.seat = String(Number(seat));
+  row.tabIndex = 0;
+  row.setAttribute("role", "button");
+  row.setAttribute("aria-label", `Lihat detail pemain ${Number(seat) + 1}`);
   row.innerHTML = `
     <div class="player-dot" data-role="dot"></div>
     <div class="player-main">
@@ -2941,6 +3622,12 @@ function createPlayerRow(seat) {
     </div>
     <div class="owned-tags" data-role="owned"></div>
   `;
+  row.addEventListener("click", () => showPlayerDetailPopup(Number(row.dataset.seat)));
+  row.addEventListener("keydown", event => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    showPlayerDetailPopup(Number(row.dataset.seat));
+  });
   return row;
 }
 
@@ -2950,6 +3637,25 @@ function shouldApplyTurnOrderLocally() {
     return false;
   }
   return true;
+}
+
+function getDisplayedPlayerPositionLabel(player) {
+  const move = roomState?.lastMove;
+  const presentation = getMovePresentation(move);
+  const isMovingPlayer = move?.id
+    && roomState?.lastRoulette?.id === move.id
+    && Number(move.seat) === Number(player?.seat)
+    && presentation?.type === "roulette"
+    && Date.now() < Number(presentation.effectsRevealAt || 0);
+
+  if (!isMovingPlayer) return `Petak ${Number(player?.position || 0)}`;
+  if (Date.now() < Number(presentation.pawnStartAt || 0)) {
+    return `Petak ${Number(move.from || 0)}`;
+  }
+  if (Date.now() < Number(presentation.arrivalAt || 0)) {
+    return "Sedang bergerak";
+  }
+  return `Petak ${Number(move.to || 0)}`;
 }
 
 function getVisiblePlayerSortKey(player) {
@@ -3079,7 +3785,8 @@ function renderPlayersList(players) {
       const orderIndex = getTurnOrderFromState(roomState).indexOf(seat);
       const orderText = ["playing", "finished"].includes(roomState?.status) && shouldApplyTurnOrderLocally() && orderIndex !== -1
         ? ` • Urutan ${orderIndex + 1}` : "";
-      sub.textContent = `Petak ${player.position || 0} • ${connectionText}${orderText} • ${activationText} • Tanah ${ownedIds.length}${player.inJail ? ` • Penjara ${Number(player.jailAttempts || 0)}/3` : ""}`;
+      const positionText = getDisplayedPlayerPositionLabel(player);
+      sub.textContent = `${positionText} • ${connectionText}${orderText} • ${activationText} • Tanah ${ownedIds.length}${player.inJail ? ` • Penjara ${Number(player.jailAttempts || 0)}/3` : ""}`;
       owned.innerHTML = ownedTags || `<span class="owned-tag">Belum punya tanah</span>`;
       const moneyState = queuePlayerMoneyChange(seat, player.money);
       setDisplayedPlayerMoney(seat, moneyState.displayed);
@@ -3133,6 +3840,55 @@ function closeHistoryModal() {
   els.historyFab?.focus();
 }
 
+function renderPlayerPaymentToast() {
+  if (!els.playerPaymentToast) return;
+  const notice = roomState?.playerPaymentNotice;
+
+  if (!notice?.id) {
+    els.playerPaymentToast.classList.add("hidden");
+    return;
+  }
+
+  const revealAt = Number(notice.revealAt || notice.createdAt || Date.now());
+  const hideAt = revealAt + PLAYER_PAYMENT_TOAST_MS;
+  const now = Date.now();
+
+  if (now < revealAt) {
+    els.playerPaymentToast.classList.add("hidden");
+    if (playerPaymentToastTimer) clearTimeout(playerPaymentToastTimer);
+    playerPaymentToastTimer = setTimeout(() => {
+      playerPaymentToastTimer = null;
+      renderPlayerPaymentToast();
+    }, Math.max(30, revealAt - now + 20));
+    return;
+  }
+
+  if (now >= hideAt) {
+    els.playerPaymentToast.classList.add("hidden");
+    els.playerPaymentToast.classList.remove("show");
+    return;
+  }
+
+  if (playerPaymentToastId !== notice.id) {
+    playerPaymentToastId = notice.id;
+    els.playerPaymentToast.textContent = notice.text || "Pembayaran antar pemain";
+    els.playerPaymentToast.classList.remove("hidden", "show");
+    void els.playerPaymentToast.offsetWidth;
+    els.playerPaymentToast.classList.add("show");
+  } else {
+    els.playerPaymentToast.classList.remove("hidden");
+  }
+
+  if (playerPaymentToastTimer) clearTimeout(playerPaymentToastTimer);
+  playerPaymentToastTimer = setTimeout(() => {
+    playerPaymentToastTimer = null;
+    if (roomState?.playerPaymentNotice?.id === notice.id) {
+      els.playerPaymentToast.classList.add("hidden");
+      els.playerPaymentToast.classList.remove("show");
+    }
+  }, Math.max(30, hideAt - now));
+}
+
 function renderCardPopup() {
   if (localPopupOpen) return;
 
@@ -3140,6 +3896,13 @@ function renderCardPopup() {
 
   if (!popup || popup.id === localHiddenCardId) {
     els.cardOverlay.classList.add("hidden");
+    return;
+  }
+
+  const revealAt = Number(popup.revealAt || roomState?.pendingAction?.revealAt || 0);
+  if (revealAt > Date.now() || (revealAt > 0 && roomState?.isRolling)) {
+    els.cardOverlay.classList.add("hidden");
+    scheduleMoveEffectsRender(Math.max(revealAt, Date.now() + 90));
     return;
   }
 
@@ -3155,7 +3918,7 @@ function renderCardPopup() {
   els.cardText.textContent = popup.text || "";
 
   const actionType = roomState.pendingAction?.type;
-  const isBlockingPopup = ["card", "taxPopup", "cardFreeParking", "roulette12Bonus", "tripleTwelveJail"].includes(actionType);
+  const isBlockingPopup = ["card", "taxPopup", "cardFreeParking", "roulette12Bonus", "tripleTwelveJail", "goJailPopup"].includes(actionType);
   const isActor = canIAct();
 
   els.cardActions.innerHTML = "";
@@ -3286,7 +4049,7 @@ async function closeCardAndFinishTurn() {
   }
 
   if (!canIAct()) {
-    const blockingForMe = ["card", "taxPopup", "cardFreeParking", "roulette12Bonus", "tripleTwelveJail"].includes(actionType)
+    const blockingForMe = ["card", "taxPopup", "cardFreeParking", "roulette12Bonus", "tripleTwelveJail", "goJailPopup"].includes(actionType)
       && Number(roomState?.pendingAction?.seat) === Number(mySeat);
 
     if (!blockingForMe) {
@@ -3300,7 +4063,7 @@ async function closeCardAndFinishTurn() {
     return;
   }
 
-  if (!["card", "taxPopup", "tripleTwelveJail"].includes(actionType)) return;
+  if (!["card", "taxPopup", "tripleTwelveJail", "goJailPopup"].includes(actionType)) return;
 
   const actor = roomState.players[mySeat];
 
@@ -3311,6 +4074,67 @@ async function closeCardAndFinishTurn() {
 
   await addRemoteLog(`${actor.name} menutup popup dan mengakhiri aksi.`);
   await finishTurn();
+}
+
+function getPlayerPropertyLevelLabel(property, level) {
+  if (property?.kind !== "city") return property?.kind === "airport" ? "Bandara" : "Perusahaan";
+  const normalizedLevel = Number(level || 0);
+  if (normalizedLevel >= 5) return "Hotel";
+  if (normalizedLevel <= 0) return "Tanah";
+  return `Rumah ${normalizedLevel}`;
+}
+
+function showPlayerDetailPopup(seat) {
+  const player = roomState?.players?.[seat];
+  if (!player?.id && !player?.bankrupt) return;
+
+  const spectator = isSpectator(player);
+  const ownedIds = spectator ? [] : getOwnedPropertyIds(seat, roomState);
+  const propertyWealth = ownedIds.reduce((total, propertyId) => {
+    return total + getPropertyLiquidationValue(propertyId, roomState);
+  }, 0);
+  const money = Number(player.money || 0);
+  const totalWealth = money + propertyWealth;
+
+  const propertyRows = ownedIds.length
+    ? ownedIds.map(propertyId => {
+        const property = PROPERTY_DATA[propertyId];
+        const propertyState = roomState?.propertyState?.[propertyId] || { level: 0 };
+        const value = getPropertyLiquidationValue(propertyId, roomState);
+        const markerColor = property.kind === "city" ? property.color : (property.kind === "airport" ? "#607d8b" : "#4d7fcc");
+        return `
+          <div class="player-property-item">
+            <span class="player-property-color" style="background:${escapeHTML(markerColor)}"></span>
+            <div class="player-property-main">
+              <strong>${escapeHTML(property.name)}</strong>
+              <span>${escapeHTML(getPlayerPropertyLevelLabel(property, propertyState.level))}</span>
+            </div>
+            <span class="player-property-value">${formatMoney(value)}</span>
+          </div>
+        `;
+      }).join("")
+    : `<div class="history-empty">${spectator ? "Penonton tidak memiliki aset permainan." : "Belum memiliki tanah."}</div>`;
+
+  localPopupOpen = true;
+  els.cardActions.innerHTML = "";
+  els.cardActions.classList.add("hidden");
+  els.cardContinueBtn.classList.remove("hidden");
+  els.cardOverlay.classList.remove("hidden");
+  els.cardPopup.className = "card-popup player-detail";
+  els.cardDeckLabel.textContent = "Detail Pemain";
+  els.cardPlayerName.textContent = spectator ? "Mode Penonton" : (player.bankrupt ? "Status Bangkrut" : "Pemain Monopoly");
+  els.cardTitle.textContent = player.name || `Pemain ${Number(seat) + 1}`;
+  els.cardText.innerHTML = `
+    <div class="player-detail-summary">
+      <div class="player-detail-stat"><span>Uang</span><strong>${formatMoney(money)}</strong></div>
+      <div class="player-detail-stat"><span>Total Kekayaan</span><strong>${formatMoney(totalWealth)}</strong></div>
+      <div class="player-detail-stat"><span>Nilai Jual Aset</span><strong>${formatMoney(propertyWealth)}</strong></div>
+      <div class="player-detail-stat"><span>Jumlah Tanah</span><strong>${ownedIds.length}</strong></div>
+    </div>
+    <div class="player-property-list">${propertyRows}</div>
+  `;
+  els.cardContinueBtn.textContent = "Tutup";
+  els.cardContinueBtn.disabled = false;
 }
 
 function showPropertyDetailPopup(propertyId) {
@@ -3345,7 +4169,7 @@ function showPropertyDetailPopup(propertyId) {
     const hasComplexBonus = Boolean(owner && hasFullGroup(ps.owner, property.group, roomState));
     const rentMultiplier = hasComplexBonus ? 2 : 1;
     els.cardText.innerHTML = `
-      <div class="detail-card-meta">Harga tanah <strong>${formatMoney(price)}</strong> • Hipotik <strong>${formatMoney(property.mortgage)}</strong>${hasComplexBonus ? " • Kompleks lengkap: sewa ×2" : ""}</div>
+      <div class="detail-card-meta">Harga tanah <strong>${formatMoney(price)}</strong> • Hipotik <strong>${formatMoney(property.mortgage)}</strong>${hasComplexBonus ? " • Kompleks lengkap: tarif efektif ×2" : ""}</div>
       <table class="popup-rent-table">
         ${property.rents.map((rent, index) => `<tr><td>${RENT_LABELS[index]}</td><td>${formatMoney(rent * rentMultiplier)}</td></tr>`).join("")}
         <tr><td>Harga bangunan</td><td>${formatMoney(property.buildingCost)}</td></tr>
@@ -3387,18 +4211,14 @@ function getTileName(tile) {
   return tile.name || "-";
 }
 
-function maybeAnimateLastMove() {
+function maybeAnimateLastMove(force = false) {
   if (!roomState?.lastMove || !gameScene) return;
 
   const move = roomState.lastMove;
-  if (move.id === lastAnimatedMoveId) return;
+  if (!force && move.id === lastAnimatedMoveId) return;
 
   lastAnimatedMoveId = move.id;
-  if (move.direct) {
-    gameScene.animatePawnDirect(move.seat, move.from, move.to, Number(move.duration || 420));
-    return;
-  }
-  gameScene.animatePawnMove(move.seat, move.from, move.steps);
+  gameScene.schedulePawnMove(move);
 }
 
 function startPhaser() {
@@ -3430,6 +4250,7 @@ class BoardScene extends Phaser.Scene {
     this.freeMoveCenterShade = null;
     this.freeMoveHint = null;
     this.propertyMarkerSignature = "";
+    this.moveStartTimers = new Map();
   }
 
   create() {
@@ -3442,7 +4263,10 @@ class BoardScene extends Phaser.Scene {
 
     this.scale.on("resize", () => {
       this.drawBoard();
-      if (roomState) this.renderRoomState(roomState);
+      if (roomState) {
+        this.renderRoomState(roomState);
+        maybeAnimateLastMove(true);
+      }
     });
 
     this.installMobileBoardTapFallback();
@@ -3526,6 +4350,8 @@ class BoardScene extends Phaser.Scene {
     const height = this.scale.height;
 
     this.tweens.killAll();
+    this.moveStartTimers.forEach(timer => timer?.remove?.(false));
+    this.moveStartTimers.clear();
     this.animatingSeats.clear();
     this.children.removeAll();
     this.tiles = [];
@@ -3817,7 +4643,17 @@ class BoardScene extends Phaser.Scene {
         if (pawnNumberText?.setText) pawnNumberText.setText(getPlayerDisplayNumber(player));
         this.pawns[seat].setVisible(true);
         this.pawns[seat].setAlpha(isPlayerConnectedInState(state, player) ? 1 : 0.55);
-        if (!this.animatingSeats.has(seat)) {
+
+        const pendingMove = state.lastMove;
+        const pendingPresentation = getMovePresentation(pendingMove);
+        const shouldPreserveMoveStart = pendingMove?.id
+          && pendingMove.id !== lastAnimatedMoveId
+          && Number(pendingMove.seat) === seat
+          && Number(pendingPresentation?.arrivalAt || (pendingMove.createdAt || 0) + Number(pendingMove.duration || 0)) > Date.now();
+
+        if (shouldPreserveMoveStart) {
+          this.setPawnPosition(seat, Number(pendingMove.from || 0), false);
+        } else if (!this.animatingSeats.has(seat)) {
           this.setPawnPosition(seat, position, false);
         }
       });
@@ -3868,6 +4704,74 @@ class BoardScene extends Phaser.Scene {
     }
   }
 
+
+  schedulePawnMove(move) {
+    if (!move?.id) return;
+
+    const seat = Number(move.seat);
+    const pawn = this.pawns[seat];
+    if (!pawn || !this.tiles.length) return;
+
+    const existingTimer = this.moveStartTimers.get(seat);
+    existingTimer?.remove?.(false);
+    this.moveStartTimers.delete(seat);
+
+    const presentation = getMovePresentation(move);
+    const startAt = Number(presentation?.pawnStartAt || Date.now());
+    const defaultDuration = move.direct
+      ? Math.max(220, Number(move.duration || DIRECT_PAWN_MOVE_MS))
+      : getPawnMoveDuration(move.steps);
+    const arrivalAt = Number(presentation?.arrivalAt || (startAt + defaultDuration));
+    const now = Date.now();
+
+    this.animatingSeats.add(seat);
+    this.tweens.killTweensOf(pawn);
+    pawn.setScale(1);
+    this.setPawnPosition(seat, Number(move.from || 0), false);
+
+    if (now >= arrivalAt) {
+      this.setPawnPosition(seat, Number(move.to || 0), false);
+      this.animatingSeats.delete(seat);
+      return;
+    }
+
+    const startMovement = () => {
+      this.moveStartTimers.delete(seat);
+      const elapsed = Math.max(0, Date.now() - startAt);
+
+      if (move.direct) {
+        const remainingDuration = Math.max(220, arrivalAt - Date.now());
+        this.animatePawnDirect(seat, Number(move.from || 0), Number(move.to || 0), remainingDuration);
+        return;
+      }
+
+      const totalSteps = Math.max(0, Number(move.steps || 0));
+      let completedSteps = 0;
+      for (let step = 1; step <= totalSteps; step++) {
+        if (getPawnStepArrivalOffset(step) <= elapsed) completedSteps = step;
+      }
+
+      const currentPosition = (Number(move.from || 0) + completedSteps) % BOARD_SIZE;
+      const remainingSteps = Math.max(0, totalSteps - completedSteps);
+      this.setPawnPosition(seat, currentPosition, false);
+
+      if (!remainingSteps) {
+        this.setPawnPosition(seat, Number(move.to || currentPosition), false);
+        this.animatingSeats.delete(seat);
+        return;
+      }
+
+      this.animatePawnMove(seat, currentPosition, remainingSteps);
+    };
+
+    const delay = Math.max(0, startAt - now);
+    if (delay <= 20) {
+      startMovement();
+    } else {
+      const timer = this.time.delayedCall(delay, startMovement);
+      this.moveStartTimers.set(seat, timer);
+    }
+  }
 
   animatePawnDirect(seat, from, to, duration = 420) {
     const pawn = this.pawns[seat];
@@ -3930,11 +4834,15 @@ class BoardScene extends Phaser.Scene {
         targets: pawn,
         x: target.x,
         y: target.y,
-        duration: 250,
-        ease: "Sine.easeInOut",
+        duration: PAWN_STEP_MS,
+        ease: "Linear",
         onComplete: () => {
           this.setPawnPosition(seat, pos, false);
-          this.time.delayedCall(25, moveOneStep);
+          if (step >= steps) {
+            moveOneStep();
+          } else {
+            this.time.delayedCall(PAWN_STEP_GAP_MS, moveOneStep);
+          }
         }
       });
 
@@ -3942,13 +4850,13 @@ class BoardScene extends Phaser.Scene {
         targets: pawn,
         scaleX: 1.16,
         scaleY: 1.16,
-        duration: 125,
+        duration: Math.max(100, Math.floor(PAWN_STEP_MS / 2)),
         yoyo: true,
         ease: "Sine.easeOut"
       });
     };
 
-    this.time.delayedCall(100, moveOneStep);
+    moveOneStep();
   }
 
   getPropertyMarkerSignature(state) {
@@ -4310,6 +5218,12 @@ async function leaveRoom() {
     : `${leavingPlayer?.name || "Pemain"} keluar dari game.`;
   await addRemoteLog(leaveLog);
 
+  resetLocalAnimationTimeline();
+  clearRouletteSpinSound();
+  if (disconnectExpiryTimer) clearTimeout(disconnectExpiryTimer);
+  if (disconnectCountdownTimer) clearInterval(disconnectCountdownTimer);
+  disconnectExpiryTimer = null;
+  disconnectCountdownTimer = null;
   roomRef.off();
   roomRef = null;
   roomState = null;
@@ -4319,6 +5233,7 @@ async function leaveRoom() {
   resetPlayerMoneyAnimations();
   renderDisconnectOverlay();
 
+  els.appRoot?.classList.remove("game-active");
   els.setupPanel.classList.remove("hidden");
   els.gamePanel.classList.add("hidden");
   els.roomBadge.textContent = "Belum masuk room";
@@ -4339,6 +5254,7 @@ window.sellSelectedPropertyForDebt = sellSelectedPropertyForDebt;
 els.rollBtn.addEventListener("click", rollDice);
 els.copyRoomBtn.addEventListener("click", copyRoomCode);
 els.leaveBtn.addEventListener("click", leaveRoom);
+els.disconnectLeaveBtn?.addEventListener("click", handleDisconnectLeave);
 els.historyFab?.addEventListener("click", openHistoryModal);
 els.historyCloseBtn?.addEventListener("click", closeHistoryModal);
 els.historyCloseTopBtn?.addEventListener("click", closeHistoryModal);
