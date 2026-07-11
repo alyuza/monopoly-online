@@ -94,82 +94,144 @@ const BOARD = [
 
 const CARD_DECKS = {
   community: [
-    {
-      deck: "Dana Umum",
-      title: "Terima Bunga dari Bank",
-      text: "Kamu menerima $100 dari bank.",
-      effect: { type: "money", amount: 100 }
-    },
-    {
-      deck: "Dana Umum",
-      title: "Bayar Biaya Dokter",
-      text: "Bayar $50 ke Uang Pajak.",
-      effect: { type: "payTax", amount: 50 }
-    },
-    {
-      deck: "Dana Umum",
-      title: "Anda Terlibat Kasus Korupsi",
-      text: "Masuk penjara.",
-      effect: { type: "jail" }
-    },
-    {
-      deck: "Dana Umum",
-      title: "Terima Warisan",
-      text: "Kamu menerima $150.",
-      effect: { type: "money", amount: 150 }
-    },
-    {
-      deck: "Dana Umum",
-      title: "Maju Sampai Start",
-      text: "Pindah ke START dan menerima $100.",
-      effect: { type: "moveTo", tile: 0, money: 100 }
-    },
-    {
-      deck: "Dana Umum",
-      title: "Mendapatkan Hadiah Pajak",
-      text: "Ambil seluruh Uang Pajak di tengah papan.",
-      effect: { type: "collectTaxPool" }
-    }
+    { id: "community-01", deck: "Dana Umum", title: "Terima Bunga dari Bank", text: "Terima bunga dari bank sebesar $200.", effect: { type: "money", amount: 200 } },
+    { id: "community-02", deck: "Dana Umum", title: "Terlibat Kasus Korupsi", text: "Anda terlibat kasus korupsi. Masuk penjara!", effect: { type: "jail" } },
+    { id: "community-03", deck: "Dana Umum", title: "Terima Bunga", text: "Terima bunga sebesar $100.", effect: { type: "money", amount: 100 } },
+    { id: "community-04", deck: "Dana Umum", title: "Dapat Komisi", text: "Dapat komisi sebesar $150.", effect: { type: "money", amount: 150 } },
+    { id: "community-05", deck: "Dana Umum", title: "Bayar Biaya Dokter", text: "Bayar biaya dokter sebesar $50.", effect: { type: "payBank", amount: 50, reason: "biaya dokter" } },
+    { id: "community-06", deck: "Dana Umum", title: "Hari Ulang Tahun", text: "Hari ulang tahun Anda. Terima $100 dari masing-masing pemain Monopoly yang masih aktif.", effect: { type: "birthday", amount: 100 } },
+    { id: "community-07", deck: "Dana Umum", title: "Terima Sisa Uang Pajak Jalan", text: "Terima sisa uang pajak jalan sebesar $100.", effect: { type: "money", amount: 100 } },
+    { id: "community-08", deck: "Dana Umum", title: "Bayar Premi Asuransi", text: "Bayar premi asuransi sebesar $50.", effect: { type: "payBank", amount: 50, reason: "premi asuransi" } },
+    { id: "community-09", deck: "Dana Umum", title: "Dibebaskan dari Penjara", text: "Simpan kartu Bebas Penjara ini dan gunakan saat diperlukan.", effect: { type: "storeJailFree" } },
+    { id: "community-10", deck: "Dana Umum", title: "Biaya Rumah Sakit", text: "Bayar biaya perawatan rumah sakit sebesar $100.", effect: { type: "payBank", amount: 100, reason: "biaya rumah sakit" } },
+    { id: "community-11", deck: "Dana Umum", title: "Hadiah Kedua", text: "Anda mendapat hadiah kedua dalam model show sebesar $75.", effect: { type: "money", amount: 75 } },
+    { id: "community-12", deck: "Dana Umum", title: "Terbang ke Bangkok", text: "Terbang ke Bangkok. Jika melewati START, terima $150.", effect: { type: "cardMove", tile: 3, passStartBonus: 150 } },
+    { id: "community-13", deck: "Dana Umum", title: "Bayar Denda atau Ambil Kesempatan", text: "Bayar denda $10 atau ambil satu kartu Kesempatan.", effect: { type: "choiceFineOrChance", amount: 10 } },
+    { id: "community-14", deck: "Dana Umum", title: "Terima Warisan", text: "Terima warisan sebesar $150.", effect: { type: "money", amount: 150 } },
+    { id: "community-15", deck: "Dana Umum", title: "Maju Sampai START", text: "Maju sampai START dan terima $100.", effect: { type: "cardMove", tile: 0, alwaysMoney: 100, applyLanding: false } },
+    { id: "community-16", deck: "Dana Umum", title: "Kesalahan Bank", text: "Karena kesalahan bank, Anda menerima $200.", effect: { type: "money", amount: 200 } },
+    { id: "community-17", deck: "Dana Umum", title: "Hadiah Pajak Jalan", text: "Ambil seluruh Uang Pajak di tengah papan permainan.", effect: { type: "collectTaxPool" } },
+    { id: "community-18", deck: "Dana Umum", title: "Menuju Parkir Bebas", text: "Pindah ke Parkir Bebas, lalu pilih hadiah Uang Pajak atau petak tujuan yang menguntungkan.", effect: { type: "moveToFreeParking" } },
+    { id: "community-19", deck: "Dana Umum", title: "Bebas Pajak", text: "Simpan kartu Bebas Pajak ini. Gunakan untuk membebaskan satu kewajiban pajak petak.", effect: { type: "storeTaxExemption" } },
+    { id: "community-20", deck: "Dana Umum", title: "Kesempatan Membangun Rumah", text: "Pilih satu kota milikmu untuk dibangun. Bayar sesuai harga bangunan kota tersebut.", effect: { type: "chooseBuild" } }
   ],
   chance: [
-    {
-      deck: "Kesempatan",
-      title: "Anda Terlibat Kasus Korupsi",
-      text: "Masuk penjara.",
-      effect: { type: "jail" }
-    },
-    {
-      deck: "Kesempatan",
-      title: "Terima Bunga dari Bank",
-      text: "Kamu menerima $50 dari bank.",
-      effect: { type: "money", amount: 50 }
-    },
-    {
-      deck: "Kesempatan",
-      title: "Melanggar Undang-Undang Lalu Lintas",
-      text: "Bayar denda $75 ke Uang Pajak.",
-      effect: { type: "payTax", amount: 75 }
-    },
-    {
-      deck: "Kesempatan",
-      title: "Maju Sampai Start",
-      text: "Pindah ke START dan menerima $100.",
-      effect: { type: "moveTo", tile: 0, money: 100 }
-    },
-    {
-      deck: "Kesempatan",
-      title: "Menuju Parkir Bebas",
-      text: "Pindah ke Parkir Bebas, lalu pilih hadiah Uang Pajak atau 1 petak tujuan yang menguntungkan.",
-      effect: { type: "moveToFreeParking" }
-    },
-    {
-      deck: "Kesempatan",
-      title: "Mendapatkan Hadiah Pajak",
-      text: "Ambil seluruh Uang Pajak di tengah papan.",
-      effect: { type: "collectTaxPool" }
-    }
+    { id: "chance-01", deck: "Kesempatan", title: "Menuju Perusahaan Air", text: "Menuju Perusahaan Air. Jika melewati START, terima $150.", effect: { type: "cardMove", tile: 12, passStartBonus: 150 } },
+    { id: "chance-02", deck: "Kesempatan", title: "Terlibat Kasus Korupsi", text: "Anda terlibat kasus korupsi. Masuk penjara!", effect: { type: "jail" } },
+    { id: "chance-03", deck: "Kesempatan", title: "Dibebaskan dari Penjara", text: "Simpan kartu Bebas Penjara ini dan gunakan saat diperlukan.", effect: { type: "storeJailFree" } },
+    { id: "chance-04", deck: "Kesempatan", title: "Terbang ke Tokyo", text: "Terbang ke Tokyo. Jika melewati START, terima $150.", effect: { type: "cardMove", tile: 11, passStartBonus: 150 } },
+    { id: "chance-05", deck: "Kesempatan", title: "Maju Sampai START", text: "Maju sampai START dan terima $100.", effect: { type: "cardMove", tile: 0, alwaysMoney: 100, applyLanding: false } },
+    { id: "chance-06", deck: "Kesempatan", title: "Terbang ke Jakarta", text: "Terbang ke Jakarta dan terima uang dinas sebesar $50.", effect: { type: "cardMove", tile: 39, alwaysMoney: 50 } },
+    { id: "chance-07", deck: "Kesempatan", title: "Terima Bunga dari Bank", text: "Terima bunga dari bank sebesar $50.", effect: { type: "money", amount: 50 } },
+    { id: "chance-08", deck: "Kesempatan", title: "Bayar Asuransi", text: "Bayar asuransi sebesar $150.", effect: { type: "payBank", amount: 150, reason: "asuransi" } },
+    { id: "chance-09", deck: "Kesempatan", title: "Pelanggaran Lalu Lintas", text: "Melanggar undang-undang lalu lintas. Bayar denda $75.", effect: { type: "payTax", amount: 75 } },
+    { id: "chance-10", deck: "Kesempatan", title: "Terima Uang Sewa dari Bank", text: "Terima uang sewa dari bank sebesar $150.", effect: { type: "money", amount: 150 } },
+    { id: "chance-11", deck: "Kesempatan", title: "Dana Pembetulan Jalan", text: "Bayar $40 untuk setiap rumah dan $100 untuk setiap hotel yang Anda miliki.", effect: { type: "roadRepair", houseAmount: 40, hotelAmount: 100 } },
+    { id: "chance-12", deck: "Kesempatan", title: "Pilih Mundur", text: "Pilih mundur 2 petak atau 5 petak. Efek petak tujuan tetap berlaku.", effect: { type: "choiceMoveBack", choices: [2, 5] } },
+    { id: "chance-13", deck: "Kesempatan", title: "Menuju Narita Airport", text: "Lanjutkan perjalanan ke Narita Airport. Jika melewati START, terima $200.", effect: { type: "cardMove", tile: 15, passStartBonus: 200 } },
+    { id: "chance-14", deck: "Kesempatan", title: "Hadiah Teka-Teki Silang", text: "Anda mendapat hadiah teka-teki silang sebesar $100.", effect: { type: "money", amount: 100 } },
+    { id: "chance-15", deck: "Kesempatan", title: "Mabuk di Tempat Umum", text: "Mabuk di tempat umum. Bayar denda $75.", effect: { type: "payTax", amount: 75 } },
+    { id: "chance-16", deck: "Kesempatan", title: "Menuju Changi Airport", text: "Maju sampai Changi Airport. Jika melewati START, terima $200.", effect: { type: "cardMove", tile: 5, passStartBonus: 200 } },
+    { id: "chance-17", deck: "Kesempatan", title: "Menuju Perusahaan Listrik", text: "Menuju Perusahaan Listrik. Jika melewati START, terima $150.", effect: { type: "cardMove", tile: 28, passStartBonus: 150 } },
+    { id: "chance-18", deck: "Kesempatan", title: "Berlibur ke Paris", text: "Berlibur ke Paris. Jika melewati START, terima $150.", effect: { type: "cardMove", tile: 27, passStartBonus: 150 } },
+    { id: "chance-19", deck: "Kesempatan", title: "Menuju Parkir Bebas", text: "Pindah ke Parkir Bebas, lalu pilih hadiah Uang Pajak atau petak tujuan yang menguntungkan.", effect: { type: "moveToFreeParking" } },
+    { id: "chance-20", deck: "Kesempatan", title: "Hadiah Pajak Jalan", text: "Ambil seluruh Uang Pajak di tengah papan permainan.", effect: { type: "collectTaxPool" } }
   ]
 };
+
+function shuffleCardIds(ids) {
+  const shuffled = [...ids];
+  for (let index = shuffled.length - 1; index > 0; index--) {
+    const randomIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[randomIndex]] = [shuffled[randomIndex], shuffled[index]];
+  }
+  return shuffled;
+}
+
+function toFirebaseCardList(ids) {
+  if (!ids.length) return null;
+  return ids.reduce((result, id, index) => {
+    result[index] = id;
+    return result;
+  }, {});
+}
+
+function normalizeCardIds(value) {
+  if (Array.isArray(value)) return value.filter(Boolean).map(String);
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort((a, b) => Number(a) - Number(b))
+      .map(key => value[key])
+      .filter(Boolean)
+      .map(String);
+  }
+  return [];
+}
+
+function makeFreshDeckState(deckKey, cycle = 1) {
+  const ids = shuffleCardIds(CARD_DECKS[deckKey].map(card => card.id));
+  return {
+    remainingIds: toFirebaseCardList(ids),
+    remainingCount: ids.length,
+    cycle: Number(cycle || 1)
+  };
+}
+
+function makeInitialCardDeckState() {
+  return {
+    community: makeFreshDeckState("community", 1),
+    chance: makeFreshDeckState("chance", 1)
+  };
+}
+
+function getCardById(deckKey, cardId) {
+  return CARD_DECKS[deckKey]?.find(card => card.id === cardId) || null;
+}
+
+function getDeckRemainingIds(stateLike, deckKey) {
+  const deckState = stateLike?.cardDeckState?.[deckKey];
+  const count = Number(deckState?.remainingCount);
+  if (!deckState) return CARD_DECKS[deckKey].map(card => card.id);
+  if (count === 0) return [];
+  const ids = normalizeCardIds(deckState.remainingIds);
+  return ids.length ? ids : CARD_DECKS[deckKey].map(card => card.id);
+}
+
+function getDeckRemainingCount(stateLike, deckKey) {
+  const count = Number(stateLike?.cardDeckState?.[deckKey]?.remainingCount);
+  return Number.isFinite(count) ? Math.max(0, count) : CARD_DECKS[deckKey].length;
+}
+
+function drawNextDeckCard(deckKey, updates) {
+  const currentDeckState = roomState?.cardDeckState?.[deckKey];
+  let remainingIds = getDeckRemainingIds(roomState, deckKey);
+  let cycle = Number(currentDeckState?.cycle || 1);
+
+  if (!remainingIds.length) {
+    cycle += 1;
+    remainingIds = shuffleCardIds(CARD_DECKS[deckKey].map(card => card.id));
+  }
+
+  const cardId = remainingIds.shift();
+  const card = getCardById(deckKey, cardId) || CARD_DECKS[deckKey][0];
+  updates[`cardDeckState/${deckKey}/remainingIds`] = toFirebaseCardList(remainingIds);
+  updates[`cardDeckState/${deckKey}/remainingCount`] = remainingIds.length;
+  updates[`cardDeckState/${deckKey}/cycle`] = cycle;
+  updates[`cardDeckState/${deckKey}/lastDrawnId`] = card.id;
+  return card;
+}
+
+function appendDeckResetUpdates(stateLike, updates) {
+  ["community", "chance"].forEach(deckKey => {
+    if (getDeckRemainingCount(stateLike, deckKey) !== 0) return;
+    const cycle = Number(stateLike?.cardDeckState?.[deckKey]?.cycle || 1) + 1;
+    const fresh = makeFreshDeckState(deckKey, cycle);
+    updates[`cardDeckState/${deckKey}/remainingIds`] = fresh.remainingIds;
+    updates[`cardDeckState/${deckKey}/remainingCount`] = fresh.remainingCount;
+    updates[`cardDeckState/${deckKey}/cycle`] = fresh.cycle;
+    updates[`cardDeckState/${deckKey}/lastDrawnId`] = null;
+  });
+}
 
 let app = null;
 let db = null;
@@ -811,6 +873,8 @@ function createInitialRoom(hostName) {
       jailAttempts: 0,
       roulette12Streak: 0,
       lapsCompleted: 0,
+      jailFreeCards: 0,
+      taxExemptionCards: 0,
       bankrupt: false,
       inGame: false,
       connected: i === 0,
@@ -837,6 +901,8 @@ function createInitialRoom(hostName) {
     cardPopup: null,
     winnerSeat: null,
     propertyState: makeInitialPropertyState(),
+    cardDeckState: makeInitialCardDeckState(),
+    deferredDebtReasons: {},
     players,
     logs: {
       [Date.now()]: `${hostName} membuat room.`
@@ -925,6 +991,8 @@ async function joinRoom() {
     playerUpdates.jailAttempts = 0;
     playerUpdates.roulette12Streak = 0;
     playerUpdates.lapsCompleted = 0;
+    playerUpdates.jailFreeCards = 0;
+    playerUpdates.taxExemptionCards = 0;
     playerUpdates.isHost = false;
   }
 
@@ -979,6 +1047,11 @@ function subscribeRoom() {
       return;
     }
 
+    if (!roomState.cardDeckState) {
+      roomRef.child("cardDeckState").set(makeInitialCardDeckState());
+      return;
+    }
+
     renderUI();
 
     if (gameScene) {
@@ -1028,6 +1101,10 @@ function isImportantGameLog(text) {
     "mengambil kartu",
     "kartu kesempatan",
     "kartu dana umum",
+    "menyimpan satu kartu",
+    "menggunakan kartu",
+    "ulang tahun",
+    "perbaikan jalan",
     "parkir bebas",
     "masuk penjara",
     "bebas dari penjara",
@@ -1877,6 +1954,28 @@ function applyLandingEffect(tileIndex, seat, playerMoney, diceTotal, updates, lo
 
   if (tile.type === "tax") {
     const popupId = `${Date.now()}_${seat}_tax_${tile.amount}_${Math.random().toString(16).slice(2)}`;
+    const exemptionCards = Number(player.taxExemptionCards || 0);
+
+    if (exemptionCards > 0) {
+      updates.cardPopup = {
+        id: popupId,
+        deckType: "tax",
+        deck: "Pajak",
+        title: `Pajak ${formatMoney(tile.amount)}`,
+        text: `${player.name} memiliki kartu Bebas Pajak. Gunakan kartu atau tetap bayar pajak ke Uang Pajak.`,
+        seat,
+        playerName: player.name
+      };
+      updates.pendingAction = {
+        type: "taxExemptionChoice",
+        seat,
+        amount: Number(tile.amount),
+        cardId: popupId
+      };
+      logs.push(`${player.name} terkena pajak ${formatMoney(tile.amount)} dan dapat menggunakan kartu Bebas Pajak.`);
+      return playerMoney;
+    }
+
     playerMoney -= tile.amount;
     updates.taxPool = Number(roomState.taxPool || 0) + tile.amount;
     updates.cardPopup = {
@@ -2174,29 +2273,53 @@ function chooseSelectedFreeMoveTarget(event) {
   chooseFreeMoveTarget(tileIndex);
 }
 
+function makeCardPendingAction(type, seat, card, extra = {}) {
+  return {
+    type,
+    seat: Number(seat),
+    cardId: card.id,
+    deckKey: card.id.startsWith("community-") ? "community" : "chance",
+    ...extra
+  };
+}
+
+function getOwnedBuildingSummary(ownerSeat, stateLike = roomState) {
+  return getOwnedPropertyIds(ownerSeat, stateLike).reduce((summary, propertyId) => {
+    const property = PROPERTY_DATA[propertyId];
+    if (property?.kind !== "city") return summary;
+    const level = Number(stateLike?.propertyState?.[propertyId]?.level || 0);
+    if (level >= 5) summary.hotels += 1;
+    else summary.houses += Math.max(0, level);
+    return summary;
+  }, { houses: 0, hotels: 0 });
+}
+
+function getCardBuildEligiblePropertyIds(ownerSeat, stateLike = roomState) {
+  return getOwnedPropertyIds(ownerSeat, stateLike).filter(propertyId => {
+    const property = PROPERTY_DATA[propertyId];
+    const level = Number(stateLike?.propertyState?.[propertyId]?.level || 0);
+    return property?.kind === "city" && level < 5;
+  });
+}
+
 function drawAndApplyCard(tileType, seat, playerMoney, updates, logs) {
   const deckKey = tileType === "community" ? "community" : "chance";
-  const deck = CARD_DECKS[deckKey];
-  const card = deck[Math.floor(Math.random() * deck.length)];
+  const card = drawNextDeckCard(deckKey, updates);
   const player = roomState.players[seat];
-  const popupId = `${Date.now()}_${seat}_${deckKey}_${Math.random().toString(16).slice(2)}`;
+  const popupId = `${Date.now()}_${seat}_${deckKey}_${card.id}_${Math.random().toString(16).slice(2)}`;
 
   updates.cardPopup = {
     id: popupId,
     deckType: deckKey,
     deck: card.deck,
+    cardId: card.id,
     title: card.title,
     text: card.text,
     seat,
     playerName: player.name
   };
 
-  updates.pendingAction = {
-    type: "card",
-    seat,
-    cardId: popupId
-  };
-
+  updates.pendingAction = makeCardPendingAction("card", seat, card, { popupId });
   logs.push(`${player.name} mengambil kartu ${card.deck}: ${card.title}.`);
 
   return applyCardEffect(card, seat, playerMoney, updates, logs);
@@ -2207,22 +2330,29 @@ function applyCardEffect(card, seat, playerMoney, updates, logs) {
   const effect = card.effect || {};
 
   if (effect.type === "money") {
-    playerMoney += Number(effect.amount || 0);
-    logs.push(`${player.name} menerima ${formatMoney(effect.amount)}.`);
+    const amount = Number(effect.amount || 0);
+    playerMoney += amount;
+    logs.push(`${player.name} menerima ${formatMoney(amount)}.`);
     return playerMoney;
+  }
+
+  if (effect.type === "payBank") {
+    const amount = Number(effect.amount || 0);
+    playerMoney -= amount;
+    logs.push(`${player.name} membayar ${formatMoney(amount)} untuk ${effect.reason || "biaya kartu"}.`);
+    return applyDebtRequirement(seat, playerMoney, updates, `${effect.reason || "biaya kartu"} ${formatMoney(amount)}`, logs);
   }
 
   if (effect.type === "payTax") {
     const amount = Number(effect.amount || 0);
     playerMoney -= amount;
     updates.taxPool = Number(updates.taxPool ?? roomState.taxPool ?? 0) + amount;
-    logs.push(`${player.name} membayar ${formatMoney(amount)} ke Uang Pajak.`);
-    return applyDebtRequirement(seat, playerMoney, updates, `denda atau pajak ${formatMoney(amount)}`, logs);
+    logs.push(`${player.name} membayar denda ${formatMoney(amount)} ke Uang Pajak.`);
+    return applyDebtRequirement(seat, playerMoney, updates, `denda ${formatMoney(amount)}`, logs);
   }
 
   if (effect.type === "collectTaxPool") {
     const pool = Number(updates.taxPool ?? roomState.taxPool ?? 0);
-
     if (pool > 0) {
       playerMoney += pool;
       updates.taxPool = 0;
@@ -2230,7 +2360,57 @@ function applyCardEffect(card, seat, playerMoney, updates, logs) {
     } else {
       logs.push(`${player.name} mendapat hadiah pajak, tetapi Uang Pajak masih kosong.`);
     }
+    return playerMoney;
+  }
 
+  if (effect.type === "birthday") {
+    const amount = Number(effect.amount || 0);
+    const payerSeats = getActiveSeatsFromState(roomState).filter(activeSeat => Number(activeSeat) !== Number(seat));
+    let totalReceived = 0;
+
+    payerSeats.forEach(payerSeat => {
+      const payer = roomState.players?.[payerSeat];
+      if (!payer || payer.bankrupt) return;
+      const nextMoney = Number(payer.money || 0) - amount;
+      updates[`players/${payerSeat}/money`] = nextMoney;
+      totalReceived += amount;
+      logs.push(`${payer.name} membayar ${player.name} ${formatMoney(amount)} untuk ulang tahun.`);
+      if (nextMoney < 0) {
+        updates[`deferredDebtReasons/${payerSeat}`] = `pembayaran ulang tahun kepada ${player.name}`;
+      }
+    });
+
+    playerMoney += totalReceived;
+    if (totalReceived > 0) {
+      logs.push(`${player.name} menerima total ${formatMoney(totalReceived)} dari pemain lain.`);
+    }
+    return playerMoney;
+  }
+
+  if (effect.type === "roadRepair") {
+    const summary = getOwnedBuildingSummary(seat, roomState);
+    const amount = (summary.houses * Number(effect.houseAmount || 0))
+      + (summary.hotels * Number(effect.hotelAmount || 0));
+    if (amount > 0) {
+      playerMoney -= amount;
+      logs.push(`${player.name} membayar perbaikan jalan ${formatMoney(amount)} untuk ${summary.houses} rumah dan ${summary.hotels} hotel.`);
+      return applyDebtRequirement(seat, playerMoney, updates, `perbaikan jalan ${formatMoney(amount)}`, logs);
+    }
+    logs.push(`${player.name} tidak memiliki rumah atau hotel, sehingga tidak membayar biaya perbaikan jalan.`);
+    return playerMoney;
+  }
+
+  if (effect.type === "storeJailFree") {
+    const nextCount = Number(player.jailFreeCards || 0) + 1;
+    updates[`players/${seat}/jailFreeCards`] = nextCount;
+    logs.push(`${player.name} menyimpan satu kartu Bebas Penjara.`);
+    return playerMoney;
+  }
+
+  if (effect.type === "storeTaxExemption") {
+    const nextCount = Number(player.taxExemptionCards || 0) + 1;
+    updates[`players/${seat}/taxExemptionCards`] = nextCount;
+    logs.push(`${player.name} menyimpan satu kartu Bebas Pajak.`);
     return playerMoney;
   }
 
@@ -2238,31 +2418,49 @@ function applyCardEffect(card, seat, playerMoney, updates, logs) {
     updates[`players/${seat}/position`] = 10;
     updates[`players/${seat}/inJail`] = true;
     updates[`players/${seat}/jailAttempts`] = 0;
-    logs.push(`${player.name} langsung masuk penjara.`);
+    updates[`players/${seat}/roulette12Streak`] = 0;
+    updates.pendingExtraRoll = null;
+    logs.push(`${player.name} langsung masuk penjara dari kartu ${card.deck}.`);
     return playerMoney;
   }
 
   if (effect.type === "moveToFreeParking") {
-    updates.pendingAction = {
-      type: "cardFreeParking",
-      seat,
-      cardId: updates.cardPopup?.id || ""
-    };
+    updates.pendingAction = makeCardPendingAction("cardFreeParking", seat, card, {
+      popupId: updates.cardPopup?.id || ""
+    });
     logs.push(`${player.name} akan menuju Parkir Bebas setelah kartu ditutup.`);
     return playerMoney;
   }
 
-  if (effect.type === "moveTo") {
-    const target = Number(effect.tile || 0);
-    updates[`players/${seat}/position`] = target;
+  if (effect.type === "cardMove") {
+    updates.pendingAction = makeCardPendingAction("cardMove", seat, card, {
+      targetTile: Number(effect.tile || 0),
+      passStartBonus: Number(effect.passStartBonus || 0),
+      alwaysMoney: Number(effect.alwaysMoney || 0),
+      applyLanding: effect.applyLanding !== false
+    });
+    logs.push(`${player.name} akan berpindah ke ${getTileName(BOARD[Number(effect.tile || 0)])} setelah kartu ditutup.`);
+    return playerMoney;
+  }
 
-    if (Number(effect.money || 0) > 0) {
-      playerMoney += Number(effect.money);
-      logs.push(`${player.name} pindah ke ${getTileName(BOARD[target])} dan menerima ${formatMoney(effect.money)}.`);
-    } else {
-      logs.push(`${player.name} pindah ke ${getTileName(BOARD[target])}.`);
-    }
+  if (effect.type === "choiceFineOrChance") {
+    updates.pendingAction = makeCardPendingAction("cardChoiceFineOrChance", seat, card, {
+      amount: Number(effect.amount || 10)
+    });
+    return playerMoney;
+  }
 
+  if (effect.type === "choiceMoveBack") {
+    updates.pendingAction = makeCardPendingAction("cardChoiceMoveBack", seat, card, {
+      choices: Array.isArray(effect.choices) ? effect.choices : [2, 5]
+    });
+    return playerMoney;
+  }
+
+  if (effect.type === "chooseBuild") {
+    updates.pendingAction = makeCardPendingAction("cardChooseBuild", seat, card, {
+      eligiblePropertyIds: getCardBuildEligiblePropertyIds(seat, roomState)
+    });
     return playerMoney;
   }
 
@@ -2489,6 +2687,7 @@ async function sellSelectedPropertyForDebt(event) {
 
     if (nextMoney >= 0) {
       updates.debtState = null;
+      updates[`deferredDebtReasons/${mySeat}`] = null;
       debtResolved = true;
     } else if (remainingIds.length > 0) {
       updates.debtState = {
@@ -2506,6 +2705,7 @@ async function sellSelectedPropertyForDebt(event) {
       updates.debtState = null;
       updates.pendingAction = null;
       updates.cardPopup = null;
+      updates[`deferredDebtReasons/${mySeat}`] = null;
       becameBankrupt = true;
     }
 
@@ -2704,8 +2904,18 @@ async function buildCurrentProperty() {
 }
 
 async function finishTurn() {
-  const latest = (await roomRef.once("value")).val();
+  let latest = (await roomRef.once("value")).val();
   if (!latest) return;
+
+  // Setelah kartu terakhir pada satu siklus selesai diproses, deck langsung
+  // dikocok ulang menjadi 20/20 sebelum permainan berlanjut.
+  const deckResetUpdates = {};
+  appendDeckResetUpdates(latest, deckResetUpdates);
+  if (Object.keys(deckResetUpdates).length) {
+    await roomRef.update(deckResetUpdates);
+    latest = (await roomRef.once("value")).val();
+    if (!latest) return;
+  }
 
   // Pemain yang masih memiliki saldo minus wajib menyelesaikan penjualan aset
   // sebelum giliran dapat berpindah.
@@ -2720,7 +2930,7 @@ async function finishTurn() {
     return;
   }
 
-  const activeSeats = getActiveSeatsFromState(latest);
+  let activeSeats = getActiveSeatsFromState(latest);
 
   if (activeSeats.length <= 1) {
     const winnerSeat = activeSeats[0] ?? null;
@@ -2753,20 +2963,69 @@ async function finishTurn() {
     return;
   }
 
-  const currentIndex = activeSeats.indexOf(Number(latest.currentSeat));
-  const nextSeat = currentIndex === -1
-    ? activeSeats[0]
-    : activeSeats[(currentIndex + 1) % activeSeats.length];
+  const getNextSeat = (seats, currentSeat) => {
+    const currentIndex = seats.indexOf(Number(currentSeat));
+    return currentIndex === -1 ? seats[0] : seats[(currentIndex + 1) % seats.length];
+  };
 
-  await roomRef.update({
-    currentSeat: nextSeat,
+  let nextSeat = getNextSeat(activeSeats, latest.currentSeat);
+  const updates = {
     isRolling: false,
     pendingAction: null,
     pendingExtraRoll: null,
     debtState: null,
     cardPopup: null
-  });
+  };
+  const bankruptcyLogs = [];
+  let safety = 0;
 
+  // Pembayaran antar pemain dari kartu ulang tahun dapat membuat pemain lain
+  // minus di luar gilirannya. Saat gilirannya tiba, pemain wajib menjual aset.
+  while (activeSeats.length > 1 && safety < MAX_GAME_PLAYERS + 2) {
+    safety += 1;
+    const candidate = latest.players?.[nextSeat];
+    const candidateMoney = Number(candidate?.money || 0);
+    if (candidateMoney >= 0) break;
+
+    const ownedIds = getOwnedPropertyIds(nextSeat, latest);
+    const reason = latest.deferredDebtReasons?.[nextSeat] || "kewajiban pembayaran kartu";
+
+    if (ownedIds.length > 0) {
+      updates.currentSeat = nextSeat;
+      updates.debtState = {
+        seat: Number(nextSeat),
+        reason,
+        deficit: Math.abs(candidateMoney),
+        resumeTurn: true,
+        createdAt: Date.now()
+      };
+      updates[`deferredDebtReasons/${nextSeat}`] = null;
+      await roomRef.update(updates);
+      await addRemoteLog(`${candidate?.name || "Pemain"} harus menjual properti untuk menutup saldo minus ${formatMoney(Math.abs(candidateMoney))}.`);
+      return;
+    }
+
+    updates[`players/${nextSeat}/money`] = 0;
+    updates[`players/${nextSeat}/bankrupt`] = true;
+    updates[`players/${nextSeat}/inJail`] = false;
+    updates[`players/${nextSeat}/jailAttempts`] = 0;
+    updates[`deferredDebtReasons/${nextSeat}`] = null;
+    bankruptcyLogs.push(`${candidate?.name || "Pemain"} bangkrut karena tidak memiliki properti untuk menutup saldo minus.`);
+    activeSeats = activeSeats.filter(seat => Number(seat) !== Number(nextSeat));
+    if (activeSeats.length <= 1) break;
+    nextSeat = getNextSeat(activeSeats, latest.currentSeat);
+  }
+
+  if (activeSeats.length <= 1) {
+    await roomRef.update(updates);
+    if (bankruptcyLogs.length) await addLogs(bankruptcyLogs);
+    await finishTurn();
+    return;
+  }
+
+  updates.currentSeat = nextSeat;
+  await roomRef.update(updates);
+  if (bankruptcyLogs.length) await addLogs(bankruptcyLogs);
   await addRemoteLog(`Giliran berpindah ke ${latest.players[nextSeat]?.name || `Pemain ${nextSeat + 1}`}.`);
 }
 
@@ -3080,12 +3339,18 @@ function renderActionPanel() {
 
   if (player?.inJail && !roomState.pendingAction && !roomState.isRolling) {
     const enabled = canIUseJailAction();
+    const jailCards = Number(player.jailFreeCards || 0);
     els.actionPanel.innerHTML = `
       <div class="action-title">${escapeHTML(player.name)} di Penjara</div>
       <div class="action-sub">
-        Percobaan keluar: ${Number(player.jailAttempts || 0)}/3. Pilih bayar $50 untuk langsung bebas, atau putar roulette dan dapatkan angka 12.
+        Percobaan keluar: ${Number(player.jailAttempts || 0)}/3. Pilih bayar $50, gunakan kartu Bebas Penjara, atau putar roulette dan dapatkan angka 12.
         Jika belum mendapat 12 sampai percobaan ke-3, pemain tetap dibebaskan dan dapat bermain pada giliran tersebut.
       </div>
+      ${jailCards > 0 ? `
+        <div class="action-row single">
+          <button class="primary" onclick="useJailFreeCard(event)" ${enabled ? "" : "disabled"}>Gunakan Kartu Bebas Penjara (${jailCards})</button>
+        </div>
+      ` : ""}
       <div class="action-row">
         <button class="gold" onclick="rollForJailRoulette()" ${enabled ? "" : "disabled"}>Coba Roulette 12</button>
         <button class="primary" onclick="payJailFine()" ${enabled ? "" : "disabled"}>Bayar $50 Bebas</button>
@@ -3178,6 +3443,80 @@ function renderActionPanel() {
       <div class="action-sub">${escapeHTML(actor?.name || "Pemain aktif")} berhenti di petak Masuk Penjara dan dipindahkan ke Penjara.</div>
       <div class="action-row single">
         <button class="primary" onclick="closeCardAndFinishTurn()" ${enabled ? "" : "disabled"}>Tutup & Lanjutkan</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (action.type === "taxExemptionChoice") {
+    const amount = Number(action.amount || 0);
+    const cards = Number(actor?.taxExemptionCards || 0);
+    els.actionPanel.innerHTML = `
+      <div class="action-title">PILIH AKSI PAJAK</div>
+      <div class="action-sub">${escapeHTML(actor?.name || "Pemain")} dapat menggunakan kartu Bebas Pajak atau membayar ${formatMoney(amount)} ke Uang Pajak.</div>
+      <div class="action-row">
+        <button class="gold" onclick="useTaxExemptionCard(event)" ${enabled && cards > 0 ? "" : "disabled"}>Gunakan Kartu (${cards})</button>
+        <button class="primary" onclick="payPendingTax(event)" ${enabled ? "" : "disabled"}>Bayar ${formatMoney(amount)}</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (action.type === "cardMove") {
+    els.actionPanel.innerHTML = `
+      <div class="action-title">${escapeHTML(roomState.cardPopup?.title || "Pindah dari Kartu")}</div>
+      <div class="action-sub">Tutup kartu untuk memindahkan pion ke ${escapeHTML(getTileName(BOARD[Number(action.targetTile || 0)]))}. Efek petak tujuan tetap berlaku.</div>
+      <div class="action-row single">
+        <button class="primary" onclick="closeCardAndFinishTurn()" ${enabled ? "" : "disabled"}>Tutup & Bergerak</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (action.type === "cardChoiceFineOrChance") {
+    const amount = Number(action.amount || 10);
+    els.actionPanel.innerHTML = `
+      <div class="action-title">PILIH EFEK KARTU</div>
+      <div class="action-sub">Bayar denda ${formatMoney(amount)} atau ambil satu kartu Kesempatan.</div>
+      <div class="action-row">
+        <button class="danger" onclick="payCardFineInsteadOfChance(event)" ${enabled ? "" : "disabled"}>Bayar ${formatMoney(amount)}</button>
+        <button class="primary" onclick="drawChanceInsteadOfFine(event)" ${enabled ? "" : "disabled"}>Ambil Kesempatan</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (action.type === "cardChoiceMoveBack") {
+    els.actionPanel.innerHTML = `
+      <div class="action-title">PILIH MUNDUR</div>
+      <div class="action-sub">Pilih mundur 2 petak atau 5 petak. Efek petak tempat berhenti tetap dijalankan.</div>
+      <div class="action-row">
+        <button class="gold" onclick="chooseCardMoveBack(2, event)" ${enabled ? "" : "disabled"}>Mundur 2</button>
+        <button class="primary" onclick="chooseCardMoveBack(5, event)" ${enabled ? "" : "disabled"}>Mundur 5</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (action.type === "cardChooseBuild") {
+    const eligibleIds = getCardBuildEligiblePropertyIds(Number(action.seat), roomState);
+    const options = eligibleIds.map(propertyId => {
+      const property = PROPERTY_DATA[propertyId];
+      const level = Number(roomState.propertyState?.[propertyId]?.level || 0);
+      const nextLabel = level >= 4 ? "Hotel" : `Rumah ${level + 1}`;
+      return `<option value="${escapeHTML(propertyId)}">${escapeHTML(property.name)} — ${nextLabel} (${formatMoney(property.buildingCost)})</option>`;
+    }).join("");
+    els.actionPanel.innerHTML = `
+      <div class="action-title">BANGUN DARI KARTU</div>
+      <div class="action-sub">Pilih satu kota milikmu. Biaya mengikuti harga bangunan kota dan level bertambah satu tahap.</div>
+      ${eligibleIds.length ? `
+        <div class="free-move-mobile-picker">
+          <select id="cardBuildPropertySelectPanel" aria-label="Pilih tanah untuk dibangun">${options}</select>
+          <button class="primary" onclick="buildSelectedPropertyFromCard(event)" ${enabled ? "" : "disabled"}>Bangun</button>
+        </div>
+      ` : `<div class="action-sub">Tidak ada kota milikmu yang masih dapat dibangun.</div>`}
+      <div class="action-row single">
+        <button class="danger" onclick="skipCardSpecialAction(event)" ${enabled ? "" : "disabled"}>Lewati Kartu</button>
       </div>
     `;
     return;
@@ -3473,7 +3812,7 @@ function buildTimedMoneyChanges(seat, fromMoney, toMoney, state) {
   const isFreshRouletteMove = Boolean(
     roomState?.isRolling
     && move?.id
-    && presentation?.type === "roulette"
+    && ["roulette", "cardMove"].includes(presentation?.type)
     && state.lastMoveMoneyId !== move.id
   );
 
@@ -3918,7 +4257,11 @@ function renderCardPopup() {
   els.cardText.textContent = popup.text || "";
 
   const actionType = roomState.pendingAction?.type;
-  const isBlockingPopup = ["card", "taxPopup", "cardFreeParking", "roulette12Bonus", "tripleTwelveJail", "goJailPopup"].includes(actionType);
+  const isBlockingPopup = [
+    "card", "taxPopup", "cardFreeParking", "cardMove", "cardChoiceFineOrChance",
+    "cardChoiceMoveBack", "cardChooseBuild", "taxExemptionChoice", "roulette12Bonus",
+    "tripleTwelveJail", "goJailPopup"
+  ].includes(actionType);
   const isActor = canIAct();
 
   els.cardActions.innerHTML = "";
@@ -3934,6 +4277,70 @@ function renderCardPopup() {
       </button>
     `;
     els.cardContinueBtn.classList.add("hidden");
+    return;
+  }
+
+  if (actionType === "taxExemptionChoice") {
+    const amount = Number(roomState.pendingAction?.amount || 0);
+    const cards = Number(roomState.players?.[roomState.pendingAction?.seat]?.taxExemptionCards || 0);
+    els.cardActions.classList.remove("hidden");
+    els.cardActions.innerHTML = `
+      <button class="gold" type="button" onclick="useTaxExemptionCard(event)" ${isActor && cards > 0 ? "" : "disabled"}>
+        Gunakan Bebas Pajak (${cards})
+      </button>
+      <button class="primary" type="button" onclick="payPendingTax(event)" ${isActor ? "" : "disabled"}>
+        Bayar ${formatMoney(amount)}
+      </button>
+    `;
+    els.cardContinueBtn.classList.add("hidden");
+    return;
+  }
+
+  if (actionType === "cardChoiceFineOrChance") {
+    const amount = Number(roomState.pendingAction?.amount || 10);
+    els.cardActions.classList.remove("hidden");
+    els.cardActions.innerHTML = `
+      <button class="danger" type="button" onclick="payCardFineInsteadOfChance(event)" ${isActor ? "" : "disabled"}>Bayar ${formatMoney(amount)}</button>
+      <button class="primary" type="button" onclick="drawChanceInsteadOfFine(event)" ${isActor ? "" : "disabled"}>Ambil Kesempatan</button>
+    `;
+    els.cardContinueBtn.classList.add("hidden");
+    return;
+  }
+
+  if (actionType === "cardChoiceMoveBack") {
+    els.cardActions.classList.remove("hidden");
+    els.cardActions.innerHTML = `
+      <button class="gold" type="button" onclick="chooseCardMoveBack(2, event)" ${isActor ? "" : "disabled"}>Mundur 2 Petak</button>
+      <button class="primary" type="button" onclick="chooseCardMoveBack(5, event)" ${isActor ? "" : "disabled"}>Mundur 5 Petak</button>
+    `;
+    els.cardContinueBtn.classList.add("hidden");
+    return;
+  }
+
+  if (actionType === "cardChooseBuild") {
+    const seat = Number(roomState.pendingAction?.seat);
+    const eligibleIds = getCardBuildEligiblePropertyIds(seat, roomState);
+    const options = eligibleIds.map(propertyId => {
+      const property = PROPERTY_DATA[propertyId];
+      const level = Number(roomState.propertyState?.[propertyId]?.level || 0);
+      const nextLabel = level >= 4 ? "Hotel" : `Rumah ${level + 1}`;
+      return `<option value="${escapeHTML(propertyId)}">${escapeHTML(property.name)} — ${nextLabel} (${formatMoney(property.buildingCost)})</option>`;
+    }).join("");
+    els.cardActions.classList.remove("hidden");
+    els.cardActions.innerHTML = eligibleIds.length ? `
+      <select id="cardBuildPropertySelectPopup" aria-label="Pilih tanah untuk dibangun">${options}</select>
+      <button class="primary" type="button" onclick="buildSelectedPropertyFromCard(event)" ${isActor ? "" : "disabled"}>Bangun</button>
+      <button class="danger" type="button" onclick="skipCardSpecialAction(event)" ${isActor ? "" : "disabled"}>Lewati</button>
+    ` : `
+      <button class="danger" type="button" onclick="skipCardSpecialAction(event)" ${isActor ? "" : "disabled"}>Tidak Ada Tanah — Tutup</button>
+    `;
+    els.cardContinueBtn.classList.add("hidden");
+    return;
+  }
+
+  if (actionType === "cardMove") {
+    els.cardContinueBtn.textContent = isActor ? "Tutup & Bergerak" : "Menunggu Pemain Aktif";
+    els.cardContinueBtn.disabled = !isActor;
     return;
   }
 
@@ -3976,6 +4383,294 @@ function hideCardPopupLocal() {
   els.cardContinueBtn.classList.remove("hidden");
 }
 
+
+function makeCardMovePresentation(createdAt, from, steps, passedStart = false, directDuration = 0) {
+  const startedAt = Number(createdAt || Date.now());
+  const pawnStartAt = startedAt + 260;
+  const moveDuration = directDuration > 0
+    ? Math.max(220, Number(directDuration))
+    : getPawnMoveDuration(Math.max(0, Number(steps || 0)));
+  const arrivalAt = pawnStartAt + moveDuration;
+  const effectsRevealAt = arrivalAt + EFFECTS_AFTER_ARRIVAL_MS;
+  const normalizedFrom = ((Number(from || 0) % BOARD_SIZE) + BOARD_SIZE) % BOARD_SIZE;
+  const startStep = passedStart ? BOARD_SIZE - normalizedFrom : 0;
+  const startBonusAt = passedStart
+    ? pawnStartAt + getPawnStepArrivalOffset(startStep)
+    : 0;
+
+  return {
+    type: "cardMove",
+    pawnStartAt,
+    arrivalAt,
+    effectsRevealAt,
+    startBonusAt,
+    moveDuration
+  };
+}
+
+async function resolveCardMoveAction(options = {}) {
+  if (!roomRef || !canIAct()) return;
+
+  const latest = (await roomRef.once("value")).val();
+  const action = latest?.pendingAction;
+  const acceptedTypes = ["cardMove", "cardChoiceMoveBack"];
+  if (!latest || !acceptedTypes.includes(action?.type) || Number(action.seat) !== Number(mySeat)) return;
+
+  roomState = latest;
+  const player = latest.players?.[mySeat];
+  if (!player) return;
+
+  const from = Number(player.position || 0);
+  const backwardSteps = Math.max(0, Number(options.backwardSteps || 0));
+  const target = backwardSteps > 0
+    ? ((from - backwardSteps) % BOARD_SIZE + BOARD_SIZE) % BOARD_SIZE
+    : Number(action.targetTile ?? 0);
+  const direct = backwardSteps > 0 || Boolean(options.direct);
+  const clockwiseSteps = backwardSteps > 0 ? 0 : getClockwiseDistance(from, target);
+  const passedStart = backwardSteps > 0 ? false : doesClockwiseMovePassStart(from, target);
+  const passStartBonus = passedStart ? Number(action.passStartBonus || 0) : 0;
+  const alwaysMoney = Number(action.alwaysMoney || 0);
+  const totalBonus = passStartBonus + alwaysMoney;
+  const createdAt = Date.now();
+  const moveId = `${createdAt}_${mySeat}_card_move_${Math.random().toString(16).slice(2)}`;
+  const presentation = makeCardMovePresentation(
+    createdAt,
+    from,
+    direct ? 0 : clockwiseSteps,
+    passedStart,
+    direct ? DIRECT_PAWN_MOVE_MS : 0
+  );
+  const updates = {
+    pendingAction: null,
+    cardPopup: null,
+    isRolling: true,
+    lastMove: {
+      id: moveId,
+      seat: mySeat,
+      from,
+      to: target,
+      steps: direct ? 0 : clockwiseSteps,
+      direct,
+      backward: backwardSteps > 0,
+      ...(direct ? { duration: DIRECT_PAWN_MOVE_MS } : {}),
+      passedStart,
+      startBonus: passStartBonus,
+      presentation,
+      createdAt
+    }
+  };
+
+  let nextMoney = Number(player.money || 0) + totalBonus;
+  const previousLaps = Number(player.lapsCompleted || 0);
+  const nextLaps = previousLaps + (passedStart ? 1 : 0);
+  updates[`players/${mySeat}/position`] = target;
+  updates[`players/${mySeat}/money`] = nextMoney;
+  updates[`players/${mySeat}/lapsCompleted`] = nextLaps;
+
+  const logs = [`${player.name} berpindah dari kartu menuju ${getTileName(BOARD[target])}.`];
+  if (passStartBonus > 0) {
+    logs.push(`${player.name} melewati START dari kartu dan menerima ${formatMoney(passStartBonus)}.`);
+  }
+  if (alwaysMoney > 0) {
+    logs.push(`${player.name} menerima ${formatMoney(alwaysMoney)} dari kartu.`);
+  }
+  if (previousLaps < 1 && passedStart) {
+    logs.push(`${player.name} menyelesaikan putaran pertama. Seluruh petak kini aktif untuk pemain ini.`);
+  }
+
+  const applyLanding = action.applyLanding !== false;
+  const boardActiveAfterMove = previousLaps >= 1 || passedStart;
+  if (applyLanding && boardActiveAfterMove) {
+    nextMoney = applyLandingEffect(
+      target,
+      mySeat,
+      nextMoney,
+      Number(latest.lastRoulette?.result || 7),
+      updates,
+      logs
+    );
+    updates[`players/${mySeat}/money`] = nextMoney;
+  }
+
+  if (updates.cardPopup) updates.cardPopup = { ...updates.cardPopup, revealAt: presentation.effectsRevealAt };
+  if (updates.pendingAction) updates.pendingAction = { ...updates.pendingAction, revealAt: presentation.effectsRevealAt };
+  if (updates.debtState) updates.debtState = { ...updates.debtState, revealAt: presentation.effectsRevealAt };
+  if (updates.playerPaymentNotice) updates.playerPaymentNotice = { ...updates.playerPaymentNotice, revealAt: presentation.effectsRevealAt };
+
+  await roomRef.update(updates);
+  await addLogs(logs);
+  scheduleActiveMoveResolution({ status: "playing", isRolling: true, lastMove: updates.lastMove });
+}
+
+async function payCardFineInsteadOfChance(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "cardChoiceFineOrChance") return;
+
+  const latest = (await roomRef.once("value")).val();
+  const action = latest?.pendingAction;
+  const player = latest?.players?.[mySeat];
+  if (!latest || !player || action?.type !== "cardChoiceFineOrChance" || Number(action.seat) !== Number(mySeat)) return;
+
+  roomState = latest;
+  const amount = Number(action.amount || 10);
+  const updates = {
+    pendingAction: null,
+    cardPopup: null,
+    taxPool: Number(latest.taxPool || 0) + amount
+  };
+  const logs = [`${player.name} memilih membayar denda ${formatMoney(amount)} ke Uang Pajak.`];
+  let nextMoney = Number(player.money || 0) - amount;
+  nextMoney = applyDebtRequirement(mySeat, nextMoney, updates, `denda kartu ${formatMoney(amount)}`, logs);
+  updates[`players/${mySeat}/money`] = nextMoney;
+
+  await roomRef.update(updates);
+  await addLogs(logs);
+  if (!updates.debtState && !updates[`players/${mySeat}/bankrupt`]) await finishTurn();
+  else if (updates[`players/${mySeat}/bankrupt`]) await finishTurn();
+}
+
+async function drawChanceInsteadOfFine(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "cardChoiceFineOrChance") return;
+
+  const latest = (await roomRef.once("value")).val();
+  const action = latest?.pendingAction;
+  const player = latest?.players?.[mySeat];
+  if (!latest || !player || action?.type !== "cardChoiceFineOrChance" || Number(action.seat) !== Number(mySeat)) return;
+
+  roomState = latest;
+  const updates = { pendingAction: null, cardPopup: null };
+  const logs = [`${player.name} memilih mengambil kartu Kesempatan sebagai pengganti denda.`];
+  let nextMoney = Number(player.money || 0);
+  nextMoney = drawAndApplyCard("chance", mySeat, nextMoney, updates, logs);
+  updates[`players/${mySeat}/money`] = nextMoney;
+  await roomRef.update(updates);
+  await addLogs(logs);
+}
+
+async function chooseCardMoveBack(steps, event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  if (![2, 5].includes(Number(steps))) return;
+  await resolveCardMoveAction({ backwardSteps: Number(steps), direct: true });
+}
+
+async function buildSelectedPropertyFromCard(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "cardChooseBuild") return;
+
+  const localContainer = event?.currentTarget?.parentElement;
+  const select = localContainer?.querySelector?.("select")
+    || document.getElementById("cardBuildPropertySelectPanel")
+    || document.getElementById("cardBuildPropertySelectPopup");
+  const propertyId = String(select?.value || "");
+  if (!PROPERTY_DATA[propertyId]) return;
+
+  const latest = (await roomRef.once("value")).val();
+  const action = latest?.pendingAction;
+  const player = latest?.players?.[mySeat];
+  const propertyState = latest?.propertyState?.[propertyId];
+  const property = PROPERTY_DATA[propertyId];
+  if (!latest || !player || action?.type !== "cardChooseBuild" || Number(action.seat) !== Number(mySeat)) return;
+  if (property.kind !== "city" || Number(propertyState?.owner) !== Number(mySeat)) return;
+
+  const level = Number(propertyState?.level || 0);
+  if (level >= 5) return;
+  const cost = Number(property.buildingCost || 0);
+  if (Number(player.money || 0) < cost) {
+    alert(`Uang tidak cukup. Biaya bangunan ${property.name} adalah ${formatMoney(cost)}.`);
+    return;
+  }
+
+  const nextLevel = level + 1;
+  const buildLabel = nextLevel >= 5 ? "hotel" : `rumah ke-${nextLevel}`;
+  await roomRef.update({
+    [`players/${mySeat}/money`]: Number(player.money || 0) - cost,
+    [`propertyState/${propertyId}/level`]: nextLevel,
+    pendingAction: null,
+    cardPopup: null
+  });
+  await addRemoteLog(`${player.name} menggunakan kartu Dana Umum untuk membangun ${buildLabel} di ${property.name} seharga ${formatMoney(cost)}.`);
+  await finishTurn();
+}
+
+async function skipCardSpecialAction(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  if (!roomRef || !canIAct()) return;
+  const actionType = roomState?.pendingAction?.type;
+  if (!['cardChooseBuild'].includes(actionType)) return;
+  await roomRef.update({ pendingAction: null, cardPopup: null });
+  await addRemoteLog(`${roomState.players?.[mySeat]?.name || "Pemain"} tidak menggunakan kesempatan membangun dari kartu.`);
+  await finishTurn();
+}
+
+async function useTaxExemptionCard(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "taxExemptionChoice") return;
+
+  const latest = (await roomRef.once("value")).val();
+  const player = latest?.players?.[mySeat];
+  const action = latest?.pendingAction;
+  if (!latest || !player || action?.type !== "taxExemptionChoice" || Number(action.seat) !== Number(mySeat)) return;
+  if (Number(player.taxExemptionCards || 0) <= 0) return;
+
+  await roomRef.update({
+    [`players/${mySeat}/taxExemptionCards`]: Number(player.taxExemptionCards || 0) - 1,
+    pendingAction: null,
+    cardPopup: null
+  });
+  await addRemoteLog(`${player.name} menggunakan kartu Bebas Pajak dan tidak membayar ${formatMoney(action.amount || 0)}.`);
+  await finishTurn();
+}
+
+async function payPendingTax(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "taxExemptionChoice") return;
+
+  const latest = (await roomRef.once("value")).val();
+  const player = latest?.players?.[mySeat];
+  const action = latest?.pendingAction;
+  if (!latest || !player || action?.type !== "taxExemptionChoice" || Number(action.seat) !== Number(mySeat)) return;
+
+  roomState = latest;
+  const amount = Number(action.amount || 0);
+  const updates = {
+    pendingAction: null,
+    cardPopup: null,
+    taxPool: Number(latest.taxPool || 0) + amount
+  };
+  const logs = [`${player.name} memilih membayar pajak ${formatMoney(amount)} ke Uang Pajak.`];
+  let nextMoney = Number(player.money || 0) - amount;
+  nextMoney = applyDebtRequirement(mySeat, nextMoney, updates, `pajak ${formatMoney(amount)}`, logs);
+  updates[`players/${mySeat}/money`] = nextMoney;
+  await roomRef.update(updates);
+  await addLogs(logs);
+  if (!updates.debtState || updates[`players/${mySeat}/bankrupt`]) await finishTurn();
+}
+
+async function useJailFreeCard(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  if (!roomRef || !canIUseJailAction()) return;
+
+  const latest = (await roomRef.once("value")).val();
+  const player = latest?.players?.[mySeat];
+  if (!latest || !player?.inJail || Number(player.jailFreeCards || 0) <= 0) return;
+
+  await roomRef.update({
+    [`players/${mySeat}/jailFreeCards`]: Number(player.jailFreeCards || 0) - 1,
+    [`players/${mySeat}/inJail`]: false,
+    [`players/${mySeat}/jailAttempts`]: 0
+  });
+  await addRemoteLog(`${player.name} menggunakan kartu Bebas Penjara dan dapat langsung bermain pada giliran ini.`);
+}
+
 async function resolveFreeParkingCard() {
   if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "cardFreeParking") return;
 
@@ -4014,8 +4709,9 @@ async function resolveFreeParkingCard() {
   updates[`players/${mySeat}/position`] = target;
 
   await roomRef.update(updates);
+  const sourceDeckLabel = action.deckKey === "community" ? "Dana Umum" : "Kesempatan";
   await addLogs([
-    `${player.name} berpindah ke Parkir Bebas dari kartu Kesempatan.`,
+    `${player.name} berpindah ke Parkir Bebas dari kartu ${sourceDeckLabel}.`,
     `${player.name} harus memilih hadiah Uang Pajak atau pindah ke petak yang menguntungkan.`
   ]);
 
@@ -4049,8 +4745,11 @@ async function closeCardAndFinishTurn() {
   }
 
   if (!canIAct()) {
-    const blockingForMe = ["card", "taxPopup", "cardFreeParking", "roulette12Bonus", "tripleTwelveJail", "goJailPopup"].includes(actionType)
-      && Number(roomState?.pendingAction?.seat) === Number(mySeat);
+    const blockingForMe = [
+      "card", "taxPopup", "cardFreeParking", "cardMove", "cardChoiceFineOrChance",
+      "cardChoiceMoveBack", "cardChooseBuild", "taxExemptionChoice", "roulette12Bonus",
+      "tripleTwelveJail", "goJailPopup"
+    ].includes(actionType) && Number(roomState?.pendingAction?.seat) === Number(mySeat);
 
     if (!blockingForMe) {
       hideCardPopupLocal();
@@ -4060,6 +4759,15 @@ async function closeCardAndFinishTurn() {
 
   if (actionType === "cardFreeParking") {
     await resolveFreeParkingCard();
+    return;
+  }
+
+  if (actionType === "cardMove") {
+    await resolveCardMoveAction();
+    return;
+  }
+
+  if (["cardChoiceFineOrChance", "cardChoiceMoveBack", "cardChooseBuild", "taxExemptionChoice"].includes(actionType)) {
     return;
   }
 
@@ -4130,6 +4838,8 @@ function showPlayerDetailPopup(seat) {
       <div class="player-detail-stat"><span>Total Kekayaan</span><strong>${formatMoney(totalWealth)}</strong></div>
       <div class="player-detail-stat"><span>Nilai Jual Aset</span><strong>${formatMoney(propertyWealth)}</strong></div>
       <div class="player-detail-stat"><span>Jumlah Tanah</span><strong>${ownedIds.length}</strong></div>
+      <div class="player-detail-stat"><span>Bebas Penjara</span><strong>${Number(player.jailFreeCards || 0)}</strong></div>
+      <div class="player-detail-stat"><span>Bebas Pajak</span><strong>${Number(player.taxExemptionCards || 0)}</strong></div>
     </div>
     <div class="player-property-list">${propertyRows}</div>
   `;
@@ -4141,9 +4851,11 @@ function showPropertyDetailPopup(propertyId) {
   const actionType = roomState?.pendingAction?.type;
   if (Date.now() < suppressBoardInputUntil
     || freeMoveSelectionStarting
-    || actionType === "freeParkingChoice"
-    || actionType === "freeMove"
-    || actionType === "cardFreeParking") {
+    || [
+      "freeParkingChoice", "freeMove", "cardFreeParking", "cardMove",
+      "cardChoiceFineOrChance", "cardChoiceMoveBack", "cardChooseBuild",
+      "taxExemptionChoice"
+    ].includes(actionType)) {
     return;
   }
 
@@ -4245,6 +4957,8 @@ class BoardScene extends Phaser.Scene {
     this.pawns = {};
     this.animatingSeats = new Set();
     this.taxAmountText = null;
+    this.chanceDeckCountText = null;
+    this.communityDeckCountText = null;
     this.tileSize = 56;
     this.tileShade = null;
     this.freeMoveCenterShade = null;
@@ -4383,6 +5097,41 @@ class BoardScene extends Phaser.Scene {
       0xd7f8dd
     );
     center.setStrokeStyle(2, 0x9abf9d);
+
+    const drawDeckCounter = (x, y, backgroundColor, label, count) => {
+      const shadow = this.add.rectangle(x, y + tile * 0.06, tile * 2.75, tile * 1.42, 0x000000, 0.10);
+      shadow.setStrokeStyle(0, 0x000000);
+      const cardBox = this.add.rectangle(x, y, tile * 2.75, tile * 1.42, backgroundColor);
+      cardBox.setStrokeStyle(2.5, 0x14213d);
+      this.add.text(x, y - tile * 0.23, label, {
+        fontFamily: "Arial",
+        fontSize: `${Math.max(9, Math.floor(tile * .19))}px`,
+        fontStyle: "bold",
+        color: "#101010",
+        align: "center"
+      }).setOrigin(.5);
+      return this.add.text(x, y + tile * 0.24, `${count}/20`, {
+        fontFamily: "Arial",
+        fontSize: `${Math.max(11, Math.floor(tile * .25))}px`,
+        fontStyle: "bold",
+        color: "#101010"
+      }).setOrigin(.5);
+    };
+
+    this.chanceDeckCountText = drawDeckCounter(
+      startX + tile * 3.35,
+      startY + tile * 3.1,
+      0xb8d9ab,
+      "KESEMPATAN",
+      getDeckRemainingCount(roomState, "chance")
+    );
+    this.communityDeckCountText = drawDeckCounter(
+      startX + tile * 7.65,
+      startY + tile * 3.1,
+      0xcf8db8,
+      "DANA UMUM",
+      getDeckRemainingCount(roomState, "community")
+    );
 
     const title = this.add.text(startX + tile * 5.5, startY + tile * 5.4, "MONOPOLY", {
       fontFamily: "Arial",
@@ -4621,6 +5370,12 @@ class BoardScene extends Phaser.Scene {
 
     if (this.taxAmountText) {
       this.taxAmountText.setText(formatMoney(state.taxPool || 0));
+    }
+    if (this.chanceDeckCountText) {
+      this.chanceDeckCountText.setText(`${getDeckRemainingCount(state, "chance")}/20`);
+    }
+    if (this.communityDeckCountText) {
+      this.communityDeckCountText.setText(`${getDeckRemainingCount(state, "community")}/20`);
     }
 
     Object.entries(this.pawns).forEach(([seat, pawn]) => {

@@ -2713,3 +2713,27 @@ body.history-open {
     font-size: 14px;
   }
 }
+
+/* V22: pilihan interaktif kartu Dana Umum dan Kesempatan. */
+.card-popup-actions select {
+  width: 100%;
+  min-width: 0;
+  min-height: 46px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 9px 10px;
+  background: var(--white);
+  color: var(--navy);
+  font-weight: 900;
+}
+
+.card-popup-actions select {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 600px) {
+  .card-popup-actions select {
+    min-height: 42px;
+    font-size: 12px;
+  }
+}
