@@ -198,6 +198,11 @@ const els = {
   actionPanel: document.getElementById("actionPanel"),
   playersList: document.getElementById("playersList"),
   logList: document.getElementById("logList"),
+  historyFab: document.getElementById("historyFab"),
+  historyOverlay: document.getElementById("historyOverlay"),
+  historyModalList: document.getElementById("historyModalList"),
+  historyCloseBtn: document.getElementById("historyCloseBtn"),
+  historyCloseTopBtn: document.getElementById("historyCloseTopBtn"),
   cardOverlay: document.getElementById("cardOverlay"),
   cardPopup: document.getElementById("cardPopup"),
   cardDeckLabel: document.getElementById("cardDeckLabel"),
@@ -396,10 +401,84 @@ function subscribeRoom() {
   });
 }
 
-async function addRemoteLog(text) {
+function isImportantGameLog(text) {
+  const normalized = String(text || "").toLowerCase();
+  if (!normalized) return false;
+
+  // Aktivitas rutin tidak perlu memenuhi riwayat permainan.
+  const ignoredPatterns = [
+    "memutar roulette",
+    "giliran berpindah",
+    "berhenti di start",
+    "hanya lewat area penjara",
+    "mendarat di tanah miliknya sendiri",
+    "mendarat di properti miliknya sendiri",
+    "tanah belum dimiliki dan bisa dibeli",
+    "melewati aksi di",
+    "menutup popup dan mengakhiri aksi"
+  ];
+
+  if (ignoredPatterns.some(pattern => normalized.includes(pattern))) {
+    return false;
+  }
+
+  // Simpan kejadian yang berpengaruh pada uang, aset, kartu, status pemain,
+  // penjara, Parkir Bebas, atau hasil permainan.
+  const importantPatterns = [
+    "menerima",
+    "membayar",
+    "mengambil uang pajak",
+    "mengambil seluruh uang pajak",
+    "membeli",
+    "membangun",
+    "sewa",
+    "pajak",
+    "denda",
+    "mengambil kartu",
+    "kartu kesempatan",
+    "kartu dana umum",
+    "parkir bebas",
+    "masuk penjara",
+    "bebas dari penjara",
+    "roulette penjara",
+    "bergabung",
+    "keluar dari game",
+    "game dimulai",
+    "game selesai",
+    "menang"
+  ];
+
+  return importantPatterns.some(pattern => normalized.includes(pattern));
+}
+
+async function trimRemoteLogsToLatest(limit = 22) {
   if (!roomRef) return;
+
+  const snapshot = await roomRef.child("logs").once("value");
+  const logs = snapshot.val() || {};
+  const sorted = Object.entries(logs)
+    .filter(([, value]) => isImportantGameLog(value))
+    .sort((a, b) => Number(b[0]) - Number(a[0]));
+
+  const keepKeys = new Set(sorted.slice(0, limit).map(([key]) => key));
+  const cleanup = {};
+
+  Object.entries(logs).forEach(([key, value]) => {
+    if (!isImportantGameLog(value) || !keepKeys.has(key)) {
+      cleanup[`logs/${key}`] = null;
+    }
+  });
+
+  if (Object.keys(cleanup).length) {
+    await roomRef.update(cleanup);
+  }
+}
+
+async function addRemoteLog(text) {
+  if (!roomRef || !isImportantGameLog(text)) return;
   const key = Date.now().toString();
   await roomRef.child(`logs/${key}`).set(text);
+  await trimRemoteLogsToLatest(22);
 }
 
 function getActiveSeats() {
@@ -985,11 +1064,19 @@ function handlePropertyLanding(propertyId, seat, playerMoney, diceTotal, updates
 }
 
 async function addLogs(logs) {
+  if (!roomRef) return;
+
+  const importantLogs = (logs || []).filter(isImportantGameLog);
+  if (!importantLogs.length) return;
+
   const updates = {};
-  logs.forEach((text, index) => {
-    updates[`logs/${Date.now() + index}`] = text;
+  const timestamp = Date.now();
+  importantLogs.forEach((text, index) => {
+    updates[`logs/${timestamp + index}`] = text;
   });
+
   await roomRef.update(updates);
+  await trimRemoteLogsToLatest(22);
 }
 
 function getPropertyState(propertyId) {
@@ -1032,7 +1119,9 @@ function calculateRent(propertyId, diceTotal = 7, stateLike = roomState) {
       .filter(item => item.kind === "utility")
       .length;
 
-    return diceTotal * (count >= 2 ? 5 : 2);
+    // Sewa perusahaan tidak lagi bergantung pada hasil roulette.
+    // Satu perusahaan = 2× nilai hipotik, dua perusahaan = 5× nilai hipotik.
+    return Number(property.mortgage || 0) * (count >= 2 ? 5 : 2);
   }
 
   return 0;
@@ -1062,42 +1151,68 @@ async function payJailFine() {
   updates.taxPool = Number(roomState.taxPool || 0) + 50;
 
   await roomRef.update(updates);
-  await addRemoteLog(`${player.name} membayar $50 dan bebas dari penjara. Pemain dapat langsung putar roulette.`);
+  await addRemoteLog(`${player.name} membayar $50 dan bebas dari penjara. Pemain dapat langsung bermain pada giliran ini.`);
 }
 
-async function rollForJailDouble() {
+async function rollForJailRoulette() {
   if (!canIUseJailAction()) return;
 
   const player = roomState.players[mySeat];
-  const d1 = Math.floor(Math.random() * 6) + 1;
-  const d2 = Math.floor(Math.random() * 6) + 1;
-  const isDouble = d1 === d2;
+  const result = Math.floor(Math.random() * 12) + 1;
   const attempts = Number(player.jailAttempts || 0) + 1;
+  const rouletteId = `${Date.now()}_${mySeat}_jail_${Math.random().toString(16).slice(2)}`;
+  const previousRotation = Number(roomState.lastRoulette?.rotation || 0);
+  const rotation = getRouletteFinalRotation(previousRotation, result);
 
-  const updates = {
-    lastDice: [d1, d2]
-  };
+  await roomRef.update({
+    isRolling: true,
+    lastDice: [0, result],
+    lastRoulette: {
+      id: rouletteId,
+      result,
+      rotation,
+      createdAt: Date.now(),
+      source: "jail"
+    }
+  });
 
-  if (isDouble) {
-    updates[`players/${mySeat}/inJail`] = false;
-    updates[`players/${mySeat}/jailAttempts`] = 0;
-    await roomRef.update(updates);
-    await addRemoteLog(`${player.name} mendapat dadu kembar ${d1}-${d2} dan bebas dari penjara. Pemain dapat langsung putar roulette untuk berjalan.`);
-    return;
-  }
+  setTimeout(async () => {
+    const latest = (await roomRef.once("value")).val();
+    if (!latest?.lastRoulette || latest.lastRoulette.id !== rouletteId) return;
 
-  if (attempts >= 3) {
-    updates[`players/${mySeat}/inJail`] = false;
-    updates[`players/${mySeat}/jailAttempts`] = 0;
-    await roomRef.update(updates);
-    await addRemoteLog(`${player.name} gagal mendapat dadu kembar pada percobaan ke-3 (${d1}-${d2}), lalu bebas dari penjara dan dapat bermain.`);
-    return;
-  }
+    const latestPlayer = latest.players?.[mySeat];
+    if (!latestPlayer?.inJail) {
+      await roomRef.update({ isRolling: false });
+      return;
+    }
 
-  updates[`players/${mySeat}/jailAttempts`] = attempts;
-  await roomRef.update(updates);
-  await addRemoteLog(`${player.name} gagal mendapat dadu kembar (${d1}-${d2}). Percobaan ${attempts}/3.`);
-  await finishTurn();
+    if (result === 12) {
+      await roomRef.update({
+        [`players/${mySeat}/inJail`]: false,
+        [`players/${mySeat}/jailAttempts`]: 0,
+        isRolling: false
+      });
+      await addRemoteLog(`${latestPlayer.name} mendapat angka 12 pada roulette penjara dan bebas dari penjara. Pemain dapat langsung bermain pada giliran ini.`);
+      return;
+    }
+
+    if (attempts >= 3) {
+      await roomRef.update({
+        [`players/${mySeat}/inJail`]: false,
+        [`players/${mySeat}/jailAttempts`]: 0,
+        isRolling: false
+      });
+      await addRemoteLog(`${latestPlayer.name} mendapat angka ${result} pada percobaan roulette penjara ke-3. Pemain tetap dibebaskan dan dapat bermain.`);
+      return;
+    }
+
+    await roomRef.update({
+      [`players/${mySeat}/jailAttempts`]: attempts,
+      isRolling: false
+    });
+    await addRemoteLog(`${latestPlayer.name} gagal keluar dari penjara karena roulette mendapat angka ${result}. Percobaan ${attempts}/3.`);
+    await finishTurn();
+  }, 1650);
 }
 
 async function buyCurrentProperty() {
@@ -1252,7 +1367,9 @@ function renderUI() {
       ? "Kamu host. Setelah minimal 2 pemain masuk, klik Mulai Game."
       : "Menunggu host memulai game.";
   } else if (roomState.isRolling) {
-    els.statusText.textContent = "Pion sedang berjalan. Tunggu sampai animasi selesai.";
+    els.statusText.textContent = current?.inJail
+      ? "Roulette penjara sedang berputar. Pemain harus mendapat angka 12 untuk bebas."
+      : "Pion sedang berjalan. Tunggu sampai animasi selesai.";
   } else if (roomState.pendingAction) {
     const actor = players[roomState.pendingAction.seat];
     if (roomState.pendingAction.type === "freeParkingChoice") {
@@ -1268,7 +1385,7 @@ function renderUI() {
     }
   } else if (current?.inJail) {
     els.statusText.textContent = Number(roomState.currentSeat) === Number(mySeat)
-      ? "Kamu sedang di penjara. Pilih bayar $50 atau coba dadu kembar."
+      ? "Kamu sedang di penjara. Pilih bayar $50 atau coba dapatkan angka 12 dari roulette."
       : `${current?.name || "Pemain aktif"} sedang di penjara.`;
   } else if (canIRoll()) {
     els.statusText.textContent = "Sekarang giliranmu. Klik Putar Roulette.";
@@ -1311,11 +1428,11 @@ function renderActionPanel() {
     els.actionPanel.innerHTML = `
       <div class="action-title">${escapeHTML(player.name)} di Penjara</div>
       <div class="action-sub">
-        Percobaan keluar: ${Number(player.jailAttempts || 0)}/3. Pilih bayar $50 untuk langsung bebas, atau coba dadu kembar.
-        Jika gagal sampai 3 kali, pemain bebas dan dapat bermain pada giliran ini.
+        Percobaan keluar: ${Number(player.jailAttempts || 0)}/3. Pilih bayar $50 untuk langsung bebas, atau putar roulette dan dapatkan angka 12.
+        Jika belum mendapat 12 sampai percobaan ke-3, pemain tetap dibebaskan dan dapat bermain pada giliran tersebut.
       </div>
       <div class="action-row">
-        <button class="gold" onclick="rollForJailDouble()" ${enabled ? "" : "disabled"}>Coba Dadu Kembar</button>
+        <button class="gold" onclick="rollForJailRoulette()" ${enabled ? "" : "disabled"}>Coba Roulette 12</button>
         <button class="primary" onclick="payJailFine()" ${enabled ? "" : "disabled"}>Bayar $50 Bebas</button>
       </div>
     `;
@@ -1323,10 +1440,15 @@ function renderActionPanel() {
   }
 
   if (roomState.isRolling) {
-    els.actionPanel.innerHTML = `
-      <div class="action-title">Pion Bergerak</div>
-      <div class="action-sub">Tunggu animasi pion selesai. Setelah itu aksi petak akan muncul jika tersedia.</div>
-    `;
+    els.actionPanel.innerHTML = player?.inJail
+      ? `
+        <div class="action-title">Roulette Penjara</div>
+        <div class="action-sub">Roulette sedang berputar. Angka 12 akan membebaskan pemain tanpa membayar.</div>
+      `
+      : `
+        <div class="action-title">Pion Bergerak</div>
+        <div class="action-sub">Tunggu animasi pion selesai. Setelah itu aksi petak akan muncul jika tersedia.</div>
+      `;
     return;
   }
 
@@ -1699,12 +1821,46 @@ function renderPlayersList(players) {
 }
 
 function renderLogs() {
-  const logs = roomState.logs || {};
-  els.logList.innerHTML = Object.entries(logs)
+  const logs = roomState?.logs || {};
+  const latestImportantLogs = Object.entries(logs)
+    .filter(([, text]) => isImportantGameLog(text))
     .sort((a, b) => Number(b[0]) - Number(a[0]))
-    .slice(0, 22)
+    .slice(0, 22);
+
+  const renderLogItems = (items) => items
     .map(([, text]) => `<div class="log-item">${escapeHTML(text)}</div>`)
     .join("");
+
+  const emptyState = '<div class="history-empty">Belum ada riwayat penting permainan.</div>';
+
+  if (els.logList) {
+    els.logList.innerHTML = latestImportantLogs.length
+      ? renderLogItems(latestImportantLogs)
+      : emptyState;
+  }
+
+  if (els.historyModalList) {
+    els.historyModalList.innerHTML = latestImportantLogs.length
+      ? renderLogItems(latestImportantLogs)
+      : emptyState;
+  }
+}
+
+function openHistoryModal() {
+  if (!els.historyOverlay) return;
+  renderLogs();
+  els.historyOverlay.classList.remove("hidden");
+  els.historyOverlay.setAttribute("aria-hidden", "false");
+  document.body.classList.add("history-open");
+  requestAnimationFrame(() => els.historyCloseTopBtn?.focus());
+}
+
+function closeHistoryModal() {
+  if (!els.historyOverlay) return;
+  els.historyOverlay.classList.add("hidden");
+  els.historyOverlay.setAttribute("aria-hidden", "true");
+  document.body.classList.remove("history-open");
+  els.historyFab?.focus();
 }
 
 function renderCardPopup() {
@@ -1909,10 +2065,10 @@ function showPropertyDetailPopup(propertyId) {
     `;
   } else {
     els.cardText.innerHTML = `
-      <div class="detail-card-meta">Harga tanah <strong>${formatMoney(price)}</strong></div>
+      <div class="detail-card-meta">Harga tanah <strong>${formatMoney(price)}</strong> • Hipotik <strong>${formatMoney(property.mortgage)}</strong></div>
       <table class="popup-rent-table">
-        <tr><td>1 perusahaan</td><td>2× angka dadu</td></tr>
-        <tr><td>2 perusahaan</td><td>5× angka dadu</td></tr>
+        <tr><td>1 perusahaan</td><td>${formatMoney(Number(property.mortgage || 0) * 2)}</td></tr>
+        <tr><td>2 perusahaan</td><td>${formatMoney(Number(property.mortgage || 0) * 5)}</td></tr>
         <tr><td>Sewa saat ini</td><td>${owner ? formatMoney(currentRent) : "-"}</td></tr>
       </table>
     `;
@@ -2003,7 +2159,11 @@ class BoardScene extends Phaser.Scene {
     this.pawns = {};
     this.propertyMarkerSignature = "";
 
-    const size = Math.max(140, Math.min(width, height) - 34);
+    // Isi papan dibuat hampir menyentuh batas canvas. Inset kecil tetap
+    // dipertahankan agar stroke terluar tidak terpotong pada layar retina.
+    const canvasSide = Math.min(width, height);
+    const boardInset = Math.max(2, Math.min(6, Math.floor(canvasSide * 0.006)));
+    const size = Math.max(140, canvasSide - boardInset * 2);
     const startX = (width - size) / 2;
     const startY = (height - size) / 2;
     const cells = 11;
@@ -2106,13 +2266,15 @@ class BoardScene extends Phaser.Scene {
         colorBand.setStrokeStyle(.5, 0x14213d);
       }
 
-      const label = this.add.text(x, y - tile * 0.02, this.getTileLabel(i), {
+      const labelText = this.getTileLabel(i);
+      const label = this.add.text(x, y - tile * 0.005, labelText, {
         fontFamily: "Arial",
-        fontSize: `${Math.max(7, Math.floor(tile * .125))}px`,
+        fontSize: `${this.getTileLabelFontSize(i, tile, labelText)}px`,
         fontStyle: "bold",
         color: "#14213d",
         align: "center",
-        wordWrap: { width: tile * .86 }
+        lineSpacing: -1,
+        wordWrap: { width: tile * .88, useAdvancedWrap: true }
       });
       label.setOrigin(.5);
 
@@ -2225,19 +2387,44 @@ class BoardScene extends Phaser.Scene {
   }
 
   getTileLabel(index) {
-    const tile = BOARD[index];
+    const boardTile = BOARD[index];
 
-    if (tile.type === "property") {
-      const property = PROPERTY_DATA[tile.propertyId];
-      return property.name.toUpperCase();
+    if (boardTile.type === "property") {
+      const labels = {
+        "kuala-lumpur": "KUALA\nLUMPUR",
+        "changi-airport": "CHANGI\nAIRPORT",
+        "perusahaan-air": "PERUSAHAAN\nAIR",
+        "narita-airport": "NARITA\nAIRPORT",
+        "new-delhi": "NEW\nDELHI",
+        "john-f-kennedy-airport": "JFK\nAIRPORT",
+        "perusahaan-listrik": "PERUSAHAAN\nLISTRIK",
+        "mexico-city": "MEXICO\nCITY",
+        "soekarno-hatta-airport": "SOEKARNO\nHATTA"
+      };
+      return labels[boardTile.propertyId] || PROPERTY_DATA[boardTile.propertyId].name.toUpperCase();
     }
 
-    if (tile.type === "tax") return `PAJAK\n${formatMoney(tile.amount)}`;
-    if (tile.type === "start") return "START";
-    if (tile.type === "jail") return "PENJARA";
-    if (tile.type === "free") return "PARKIR\nBEBAS";
-    if (tile.type === "go-jail") return "MASUK\nPENJARA";
-    return tile.name || `PETAK ${index}`;
+    if (boardTile.type === "tax") return `PAJAK\n${formatMoney(boardTile.amount)}`;
+    if (boardTile.type === "start") return "START";
+    if (boardTile.type === "jail") return "PENJARA";
+    if (boardTile.type === "free") return "PARKIR\nBEBAS";
+    if (boardTile.type === "go-jail") return "MASUK\nPENJARA";
+    return boardTile.name || `PETAK ${index}`;
+  }
+
+  getTileLabelFontSize(index, tileSize, labelText) {
+    const compactLength = String(labelText || "").replace(/\n/g, "").length;
+    const lineCount = String(labelText || "").split("\n").length;
+    let ratio = 0.125;
+
+    if (compactLength >= 13 || lineCount >= 2) ratio = 0.105;
+    if (compactLength >= 18) ratio = 0.092;
+
+    const boardTile = BOARD[index];
+    if (["community", "chance", "tax"].includes(boardTile.type)) ratio = Math.min(ratio, 0.112);
+    if (["start", "jail", "free", "go-jail"].includes(boardTile.type)) ratio = Math.min(ratio, 0.11);
+
+    return Math.max(5, Math.min(10, Math.floor(tileSize * ratio)));
   }
 
   renderRoomState(state) {
@@ -2446,8 +2633,6 @@ class BoardScene extends Phaser.Scene {
     marker.setDepth(44);
 
     const tile = this.tileSize;
-    const side = this.getPropertyMarkerSide(tileIndex);
-    const isVertical = side === "left" || side === "right";
     const dotX = -tile * 0.32;
     const dotY = tile * 0.30;
     const dotRadius = Math.max(3.4, tile * 0.075);
@@ -2475,10 +2660,10 @@ class BoardScene extends Phaser.Scene {
     if (level >= 5) {
       const hotelLong = Math.max(11, tile * 0.29);
       const hotelShort = Math.max(5, tile * 0.105);
-      const hotelX = isVertical ? dotX : dotX + buildStart + hotelLong / 2;
-      const hotelY = isVertical ? dotY - buildStart - hotelLong / 2 : dotY;
-      const hotelWidth = isVertical ? hotelShort : hotelLong;
-      const hotelHeight = isVertical ? hotelLong : hotelShort;
+      const hotelX = dotX + buildStart + hotelLong / 2;
+      const hotelY = dotY;
+      const hotelWidth = hotelLong;
+      const hotelHeight = hotelShort;
 
       const hotelShadow = this.add.rectangle(
         hotelX + Math.max(1, tile * 0.015),
@@ -2496,8 +2681,8 @@ class BoardScene extends Phaser.Scene {
 
     const houseCount = Math.min(4, Math.max(0, level));
     for (let index = 0; index < houseCount; index++) {
-      const houseX = isVertical ? dotX : dotX + buildStart + index * step;
-      const houseY = isVertical ? dotY - buildStart - index * step : dotY;
+      const houseX = dotX + buildStart + index * step;
+      const houseY = dotY;
       const houseShadow = this.add.rectangle(
         houseX + Math.max(0.8, tile * 0.012),
         houseY + Math.max(0.8, tile * 0.012),
@@ -2684,6 +2869,17 @@ window.collectFreeParkingTax = collectFreeParkingTax;
 els.rollBtn.addEventListener("click", rollDice);
 els.copyRoomBtn.addEventListener("click", copyRoomCode);
 els.leaveBtn.addEventListener("click", leaveRoom);
+els.historyFab?.addEventListener("click", openHistoryModal);
+els.historyCloseBtn?.addEventListener("click", closeHistoryModal);
+els.historyCloseTopBtn?.addEventListener("click", closeHistoryModal);
+els.historyOverlay?.addEventListener("click", (event) => {
+  if (event.target === els.historyOverlay) closeHistoryModal();
+});
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && els.historyOverlay && !els.historyOverlay.classList.contains("hidden")) {
+    closeHistoryModal();
+  }
+});
 els.cardCloseBtn.addEventListener("click", closeCardAndFinishTurn);
 els.cardContinueBtn.addEventListener("click", closeCardAndFinishTurn);
 

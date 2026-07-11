@@ -4,14 +4,17 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Monopoly Board Game</title>
-  <link rel="stylesheet" href="./style.css?v=money-animation-2" />
+  <link rel="stylesheet" href="./style.css?v=utility-jail-ui-1" />
 </head>
 <body>
   <main class="app">
     <section class="topbar">
       <div>
         <h1>Monopoly Board Game</h1>
-        <p>Online MVP: room, 4 pemain, roulette realtime, pion animasi, beli tanah, sewa, uang pajak, parkir bebas, dan bangun rumah/hotel.</p>
+        <p class="game-subtitle">
+          <span class="desktop-subtitle">Online MVP: room, 4 pemain, roulette realtime, pion animasi, beli tanah, sewa, uang pajak, parkir bebas, dan bangun rumah/hotel.</span>
+          <span class="mobile-subtitle">Online, maksimal 4 pemain dalam satu room.</span>
+        </p>
       </div>
 
       <div class="room-info">
@@ -63,8 +66,9 @@
       </section>
 
       <aside class="side-panel">
-        <section class="panel-card">
+        <section class="panel-card control-card">
           <h2>Kontrol Giliran</h2>
+          <button id="historyFab" class="history-fab" type="button" aria-label="Buka riwayat permainan" title="Riwayat permainan">☰</button>
           <div class="turn-box">
             <div class="label">Giliran Saat Ini</div>
             <strong id="turnName">-</strong>
@@ -100,16 +104,32 @@
           <p id="statusText" class="status-text">Menunggu masuk room.</p>
         </section>
 
-        <section class="panel-card">
+        <section class="panel-card action-card">
           <h2>Aksi Petak</h2>
           <div id="actionPanel" class="action-panel"></div>
         </section>
 
-        <section class="panel-card">
+        <section class="panel-card players-card">
           <h2>Data Pemain</h2>
           <div id="playersList" class="players-list"></div>
         </section>
       </aside>
+    </section>
+
+
+
+    <section id="historyOverlay" class="history-overlay hidden" aria-hidden="true">
+      <div class="history-modal" role="dialog" aria-modal="true" aria-labelledby="historyModalTitle">
+        <div class="history-modal-header">
+          <div>
+            <div class="history-modal-kicker">CATATAN GAME</div>
+            <h2 id="historyModalTitle">Riwayat Permainan</h2>
+          </div>
+          <button id="historyCloseTopBtn" class="history-modal-x" type="button" aria-label="Tutup riwayat">×</button>
+        </div>
+        <div id="historyModalList" class="history-modal-list"></div>
+        <button id="historyCloseBtn" class="primary history-close-btn" type="button">Tutup Riwayat</button>
+      </div>
     </section>
 
     <section id="cardOverlay" class="card-overlay hidden">
@@ -131,6 +151,6 @@
   <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
 
   <script src="./firebase-config.js"></script>
-  <script src="./game.js?v=property-markers-1"></script>
+  <script src="./game.js?v=utility-jail-ui-1"></script>
 </body>
 </html>

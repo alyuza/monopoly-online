@@ -1482,3 +1482,588 @@ input {
     animation-duration: .16s;
   }
 }
+
+/* V11: mobile portrait satu layar + popup riwayat.
+   Aturan ini hanya mengubah presentasi; struktur dan logic game tetap sama. */
+.mobile-subtitle,
+.history-fab {
+  display: none;
+}
+
+body.history-open {
+  overflow: hidden;
+}
+
+.history-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10020;
+  display: grid;
+  place-items: center;
+  padding:
+    max(12px, env(safe-area-inset-top))
+    max(12px, env(safe-area-inset-right))
+    max(12px, env(safe-area-inset-bottom))
+    max(12px, env(safe-area-inset-left));
+  background: rgba(7, 18, 34, .72);
+  backdrop-filter: blur(4px);
+}
+
+.history-modal {
+  width: min(560px, 100%);
+  max-height: min(82dvh, 720px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 2px solid rgba(242, 184, 75, .85);
+  border-radius: 22px;
+  background: linear-gradient(180deg, #fffaf0, #f8e4af);
+  box-shadow: 0 26px 70px rgba(0, 0, 0, .42);
+}
+
+.history-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 16px 12px;
+  border-bottom: 1px solid rgba(216, 189, 132, .75);
+}
+
+.history-modal-header h2 {
+  margin: 2px 0 0;
+  font-size: 22px;
+}
+
+.history-modal-kicker {
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 1000;
+  letter-spacing: .8px;
+}
+
+.history-modal-x {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  min-height: 40px;
+  padding: 0;
+  border-radius: 50%;
+  background: #fff;
+  color: var(--red);
+  font-size: 28px;
+  line-height: 1;
+}
+
+.history-modal-list {
+  min-height: 120px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  padding: 12px 14px;
+  scrollbar-width: thin;
+}
+
+.history-modal-list .log-item {
+  font-size: 13px;
+  line-height: 1.42;
+}
+
+.history-empty {
+  padding: 30px 16px;
+  color: var(--muted);
+  text-align: center;
+  font-weight: 800;
+}
+
+.history-close-btn {
+  flex: 0 0 auto;
+  width: calc(100% - 28px);
+  margin: 0 14px 14px;
+}
+
+@media (orientation: portrait) and (max-width: 700px) {
+  html,
+  body {
+    width: 100%;
+    min-height: 100%;
+    overflow-x: hidden;
+  }
+
+  body {
+    padding:
+      max(2px, env(safe-area-inset-top))
+      max(2px, env(safe-area-inset-right))
+      max(2px, env(safe-area-inset-bottom))
+      max(2px, env(safe-area-inset-left));
+  }
+
+  .app {
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+  }
+
+  .topbar {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 4px;
+    margin-bottom: 3px;
+    padding: 7px 8px 6px;
+    border-radius: 12px;
+    box-shadow: 0 5px 14px rgba(0, 0, 0, .18);
+  }
+
+  .topbar h1 {
+    margin: 0;
+    font-size: clamp(18px, 5.2vw, 21px);
+    line-height: 1.05;
+    letter-spacing: -.35px;
+  }
+
+  .game-subtitle {
+    margin: 2px 0 0 !important;
+    font-size: 10px !important;
+    line-height: 1.15 !important;
+  }
+
+  .desktop-subtitle {
+    display: none;
+  }
+
+  .mobile-subtitle {
+    display: inline;
+  }
+
+  .room-info {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(72px, .82fr) minmax(64px, .68fr);
+    gap: 4px;
+    width: 100%;
+  }
+
+  #roomBadge,
+  .room-info button {
+    grid-column: auto;
+    min-width: 0;
+    min-height: 32px;
+    height: 32px;
+    padding: 5px 7px;
+    border-radius: 8px;
+    font-size: 10px;
+    line-height: 1;
+  }
+
+  #roomBadge {
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: center;
+  }
+
+  .orientation-hint {
+    display: none !important;
+  }
+
+  .game-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+    align-items: start;
+  }
+
+  .board-column {
+    display: block;
+    min-width: 0;
+  }
+
+  .board-shell {
+    width: 100%;
+    padding: 0;
+    overflow: hidden;
+    border-width: 2px;
+    border-radius: 8px;
+    box-shadow: 0 5px 15px rgba(0, 0, 0, .18);
+    background: #14213d;
+  }
+
+  #gameCanvas {
+    width: 100%;
+    min-height: 0;
+    margin: 0;
+    aspect-ratio: 1 / 1;
+    overflow: hidden;
+    border: 0;
+    border-radius: 0;
+    background: #14213d;
+  }
+
+  #gameCanvas canvas {
+    display: block;
+    width: 100% !important;
+    height: 100% !important;
+  }
+
+  .board-log-card {
+    display: none !important;
+  }
+
+  .side-panel {
+    height: clamp(200px, calc(100dvh - 100vw - 93px), 300px);
+    min-height: 200px;
+    max-height: 300px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) clamp(112px, 31vw, 132px);
+    grid-template-rows: minmax(62px, auto) minmax(0, 1fr);
+    grid-template-areas:
+      "action control"
+      "players control";
+    align-items: stretch;
+    align-content: stretch;
+    gap: 3px;
+    padding: 3px;
+    overflow: hidden;
+    border-width: 1px;
+    border-radius: 8px;
+    box-shadow: 0 5px 15px rgba(0, 0, 0, .16);
+  }
+
+  .side-panel > .panel-card {
+    min-height: 0;
+    margin: 0;
+    padding: 6px;
+    overflow: hidden;
+    border-radius: 7px;
+  }
+
+  .action-card {
+    grid-area: action;
+    overflow-y: auto !important;
+    overscroll-behavior: contain;
+  }
+
+  .players-card {
+    grid-area: players;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .control-card {
+    grid-area: control;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: visible !important;
+  }
+
+  .side-panel .panel-card h2 {
+    margin: 0 0 4px;
+    font-size: 11px;
+    line-height: 1.05;
+  }
+
+  .action-card .action-panel {
+    gap: 4px;
+  }
+
+  .action-card .action-title {
+    font-size: 10px;
+    line-height: 1.08;
+  }
+
+  .action-card .action-sub,
+  .action-card .price-pill {
+    font-size: 7px;
+    line-height: 1.18;
+  }
+
+  .action-card .price-pill {
+    padding: 3px 5px;
+  }
+
+  .action-card .action-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 3px;
+  }
+
+  .action-card .action-row.single {
+    grid-template-columns: 1fr;
+  }
+
+  .action-card button {
+    min-height: 27px;
+    padding: 4px 5px;
+    border-radius: 6px;
+    font-size: 7px;
+    line-height: 1.05;
+  }
+
+  .players-card h2 {
+    flex: 0 0 auto;
+  }
+
+  .players-list {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    gap: 4px;
+    padding-right: 1px;
+    scrollbar-width: thin;
+  }
+
+  .player-row {
+    grid-template-columns: 21px minmax(0, 1fr) auto;
+    gap: 4px;
+    padding: 4px;
+    border-radius: 7px;
+  }
+
+  .player-row.active {
+    outline-width: 2px;
+  }
+
+  .player-dot {
+    width: 21px;
+    height: 21px;
+    font-size: 9px;
+  }
+
+  .player-name {
+    font-size: 9px;
+    line-height: 1.05;
+  }
+
+  .player-sub {
+    overflow: hidden;
+    font-size: 6.5px;
+    line-height: 1.1;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .money-wrap {
+    grid-column: 3;
+    justify-self: end;
+    min-width: 48px;
+    text-align: right;
+  }
+
+  .money {
+    font-size: 9px;
+  }
+
+  .money-change {
+    right: -2px;
+    left: auto;
+    padding: 3px 6px;
+    font-size: 9px;
+  }
+
+  .owned-tags {
+    grid-column: 2 / 4;
+    display: flex;
+    max-height: 12px;
+    overflow: hidden;
+    gap: 2px;
+  }
+
+  .owned-tag {
+    padding: 2px 4px;
+    font-size: 5.5px;
+    line-height: 1;
+  }
+
+  .control-card h2 {
+    padding-right: 31px;
+  }
+
+  .history-fab {
+    position: absolute;
+    top: 27px;
+    right: 5px;
+    z-index: 8;
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    min-height: 28px;
+    padding: 0;
+    border: 1px solid rgba(20, 33, 61, .28);
+    border-radius: 50%;
+    background: rgba(255, 250, 240, .94);
+    color: var(--navy);
+    box-shadow: -5px 6px 12px rgba(15, 27, 46, .25);
+    font-size: 15px;
+    line-height: 1;
+  }
+
+  .control-card .turn-box {
+    padding-right: 28px;
+  }
+
+  .control-card .label {
+    margin-bottom: 1px;
+    font-size: 6.5px;
+  }
+
+  .control-card .turn-box strong {
+    max-width: 85px;
+    overflow: hidden;
+    font-size: 15px;
+    line-height: 1.05;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .control-card .roulette-box {
+    flex: 0 0 auto;
+    gap: 2px;
+    margin: 4px 0 2px;
+  }
+
+  .control-card .roulette-wheel-wrap {
+    width: 88px;
+    height: 88px;
+  }
+
+  .control-card .roulette-wheel {
+    width: 84px;
+    height: 84px;
+    border-width: 4px;
+  }
+
+  .control-card .roulette-number {
+    width: 16px;
+    height: 16px;
+    margin-left: -8px;
+    margin-top: -8px;
+    font-size: 7px;
+  }
+
+  .control-card .roulette-number.n1 { transform: rotate(-90deg) translate(30px) rotate(90deg); }
+  .control-card .roulette-number.n2 { transform: rotate(-60deg) translate(30px) rotate(60deg); }
+  .control-card .roulette-number.n3 { transform: rotate(-30deg) translate(30px) rotate(30deg); }
+  .control-card .roulette-number.n4 { transform: rotate(0deg) translate(30px) rotate(0deg); }
+  .control-card .roulette-number.n5 { transform: rotate(30deg) translate(30px) rotate(-30deg); }
+  .control-card .roulette-number.n6 { transform: rotate(60deg) translate(30px) rotate(-60deg); }
+  .control-card .roulette-number.n7 { transform: rotate(90deg) translate(30px) rotate(-90deg); }
+  .control-card .roulette-number.n8 { transform: rotate(120deg) translate(30px) rotate(-120deg); }
+  .control-card .roulette-number.n9 { transform: rotate(150deg) translate(30px) rotate(-150deg); }
+  .control-card .roulette-number.n10 { transform: rotate(180deg) translate(30px) rotate(-180deg); }
+  .control-card .roulette-number.n11 { transform: rotate(210deg) translate(30px) rotate(-210deg); }
+  .control-card .roulette-number.n12 { transform: rotate(240deg) translate(30px) rotate(-240deg); }
+
+  .control-card .roulette-center {
+    width: 38px;
+    height: 38px;
+    border-width: 2px;
+  }
+
+  .control-card .roulette-center span {
+    font-size: 17px;
+  }
+
+  .control-card .roulette-pointer {
+    top: -2px;
+    border-left-width: 7px;
+    border-right-width: 7px;
+    border-bottom-width: 12px;
+  }
+
+  .control-card .roulette-caption {
+    font-size: 6.5px;
+    line-height: 1.1;
+    white-space: nowrap;
+  }
+
+  .control-card .full {
+    flex: 0 0 auto;
+    min-height: 28px;
+    margin-top: 3px;
+    padding: 4px 5px;
+    border-radius: 6px;
+    font-size: 7.5px;
+  }
+
+  .control-card .status-text {
+    display: -webkit-box;
+    margin: 3px 0 0;
+    overflow: hidden;
+    font-size: 6px;
+    line-height: 1.12;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  .history-modal {
+    max-height: calc(100dvh - 24px);
+    border-radius: 16px;
+  }
+
+  .history-modal-header {
+    padding: 12px 12px 9px;
+  }
+
+  .history-modal-header h2 {
+    font-size: 18px;
+  }
+
+  .history-modal-list {
+    gap: 6px;
+    padding: 9px 10px;
+  }
+
+  .history-modal-list .log-item {
+    padding: 8px;
+    font-size: 11px;
+  }
+
+  .history-close-btn {
+    min-height: 40px;
+    margin: 0 10px 10px;
+  }
+}
+
+@media (orientation: portrait) and (max-width: 360px) {
+  .side-panel {
+    grid-template-columns: minmax(0, 1fr) 105px;
+  }
+
+  .control-card .roulette-wheel-wrap {
+    width: 78px;
+    height: 78px;
+  }
+
+  .control-card .roulette-wheel {
+    width: 74px;
+    height: 74px;
+  }
+
+  .control-card .roulette-number.n1 { transform: rotate(-90deg) translate(26px) rotate(90deg); }
+  .control-card .roulette-number.n2 { transform: rotate(-60deg) translate(26px) rotate(60deg); }
+  .control-card .roulette-number.n3 { transform: rotate(-30deg) translate(26px) rotate(30deg); }
+  .control-card .roulette-number.n4 { transform: rotate(0deg) translate(26px) rotate(0deg); }
+  .control-card .roulette-number.n5 { transform: rotate(30deg) translate(26px) rotate(-30deg); }
+  .control-card .roulette-number.n6 { transform: rotate(60deg) translate(26px) rotate(-60deg); }
+  .control-card .roulette-number.n7 { transform: rotate(90deg) translate(26px) rotate(-90deg); }
+  .control-card .roulette-number.n8 { transform: rotate(120deg) translate(26px) rotate(-120deg); }
+  .control-card .roulette-number.n9 { transform: rotate(150deg) translate(26px) rotate(-150deg); }
+  .control-card .roulette-number.n10 { transform: rotate(180deg) translate(26px) rotate(-180deg); }
+  .control-card .roulette-number.n11 { transform: rotate(210deg) translate(26px) rotate(-210deg); }
+  .control-card .roulette-number.n12 { transform: rotate(240deg) translate(26px) rotate(-240deg); }
+}
+
+
+/* V9: popup detail properti lebih ringkas */
+.card-popup.property-detail {
+  width: clamp(270px, 76vw, 390px);
+  max-width: calc(100vw - 28px);
+  max-height: min(84dvh, 640px);
+  overflow-y: auto;
+}
