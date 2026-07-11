@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Monopoly Board Game</title>
-  <link rel="stylesheet" href="./style.css?v=utility-jail-ui-1" />
+  <link rel="stylesheet" href="./style.css?v=reconnect-rent-1" />
 </head>
 <body>
   <main class="app">
@@ -132,6 +132,16 @@
       </div>
     </section>
 
+    <section id="disconnectOverlay" class="disconnect-overlay hidden" aria-hidden="true">
+      <div class="disconnect-modal" role="alertdialog" aria-modal="true" aria-labelledby="disconnectTitle">
+        <div class="disconnect-spinner" aria-hidden="true"></div>
+        <div class="disconnect-kicker">KONEKSI PEMAIN</div>
+        <h2 id="disconnectTitle">Permainan Dijeda</h2>
+        <p id="disconnectText">Menunggu pemain terhubung kembali.</p>
+        <div class="disconnect-note">Jangan keluar dari room. Permainan akan dilanjutkan otomatis.</div>
+      </div>
+    </section>
+
     <section id="cardOverlay" class="card-overlay hidden">
       <div id="cardPopup" class="card-popup">
         <button id="cardCloseBtn" class="card-x" type="button">×</button>
@@ -151,6 +161,6 @@
   <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
 
   <script src="./firebase-config.js"></script>
-  <script src="./game.js?v=utility-jail-ui-1"></script>
+  <script src="./game.js?v=reconnect-rent-1"></script>
 </body>
 </html>

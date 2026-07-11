@@ -2067,3 +2067,213 @@ body.history-open {
   max-height: min(84dvh, 640px);
   overflow-y: auto;
 }
+
+
+/* V13: sentuhan papan iPhone untuk pemilihan tujuan Parkir Bebas. */
+#gameCanvas,
+#gameCanvas canvas {
+  touch-action: none;
+  -ms-touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.card-overlay,
+.card-popup,
+.card-popup-actions,
+.card-popup-actions button {
+  touch-action: manipulation;
+}
+
+
+/* Fallback pemilihan petak di HP agar giliran tidak dapat terkunci. */
+.free-move-mobile-picker {
+  display: none;
+}
+
+@media (orientation: portrait) and (max-width: 700px) {
+  .free-move-mobile-picker {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px;
+    margin-top: 3px;
+  }
+
+  .free-move-mobile-picker select,
+  .free-move-mobile-picker button {
+    width: 100%;
+    min-width: 0;
+    min-height: 28px;
+    height: 28px;
+    padding: 3px 5px;
+    border-radius: 6px;
+    font-size: 7px;
+    font-weight: 900;
+  }
+
+  .free-move-mobile-picker select {
+    border: 1px solid var(--line);
+    background: var(--white);
+    color: var(--navy);
+  }
+}
+
+/* V14: pelunasan saldo minus dan status pemain bangkrut. */
+.debt-property-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.debt-property-picker select,
+.debt-property-picker button {
+  width: 100%;
+  min-width: 0;
+}
+
+.debt-property-picker select {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 10px;
+  background: var(--white);
+  color: var(--navy);
+  font-weight: 900;
+}
+
+.player-row.bankrupt {
+  opacity: .68;
+  filter: grayscale(.35);
+  outline: 2px dashed rgba(198, 64, 64, .65);
+  background: #f4ece7;
+}
+
+.player-row.bankrupt .player-name,
+.player-row.bankrupt .money {
+  color: #8d2f2f;
+}
+
+.bankrupt-tag {
+  background: #ffe5e2;
+  color: #a62020;
+}
+
+@media (orientation: portrait) and (max-width: 700px) {
+  .debt-property-picker {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px;
+    margin-top: 3px;
+  }
+
+  .debt-property-picker select,
+  .debt-property-picker button {
+    min-height: 28px;
+    height: 28px;
+    padding: 3px 5px;
+    border-radius: 6px;
+    font-size: 7px;
+  }
+}
+
+
+/* V15: status disconnect realtime dan host/reconnect. */
+.disconnect-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 12000;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(15, 27, 46, .72);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+}
+
+.disconnect-modal {
+  width: min(420px, calc(100vw - 32px));
+  border: 3px solid var(--gold);
+  border-radius: 24px;
+  padding: 24px 22px;
+  text-align: center;
+  color: var(--navy);
+  background: linear-gradient(180deg, #fffaf0, #f8e4af);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .35);
+}
+
+.disconnect-spinner {
+  width: 44px;
+  height: 44px;
+  margin: 0 auto 12px;
+  border: 5px solid rgba(15, 107, 79, .2);
+  border-top-color: var(--green);
+  border-radius: 50%;
+  animation: disconnectSpin .9s linear infinite;
+}
+
+.disconnect-kicker {
+  font-size: 11px;
+  font-weight: 1000;
+  letter-spacing: .8px;
+  color: var(--green);
+}
+
+.disconnect-modal h2 {
+  margin: 5px 0 8px;
+  font-size: 25px;
+}
+
+.disconnect-modal p {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.45;
+}
+
+.disconnect-note {
+  margin-top: 14px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  color: var(--muted);
+  background: rgba(255, 250, 240, .72);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.player-row.disconnected {
+  opacity: .72;
+  outline: 2px dashed rgba(242, 184, 75, .9);
+}
+
+.player-row.disconnected .player-name::after {
+  content: " • OFFLINE";
+  color: #b06a00;
+  font-size: .72em;
+}
+
+@keyframes disconnectSpin {
+  to { transform: rotate(360deg); }
+}
+
+@media (orientation: portrait) and (max-width: 700px) {
+  .disconnect-modal {
+    width: min(330px, calc(100vw - 28px));
+    padding: 18px 16px;
+    border-radius: 18px;
+  }
+
+  .disconnect-spinner {
+    width: 36px;
+    height: 36px;
+    border-width: 4px;
+  }
+
+  .disconnect-modal h2 {
+    font-size: 20px;
+  }
+
+  .disconnect-modal p {
+    font-size: 12px;
+  }
+}

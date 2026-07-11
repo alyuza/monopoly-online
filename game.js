@@ -171,6 +171,21 @@ let lastRouletteId = "";
 let localHiddenCardId = "";
 let localPopupOpen = false;
 let freeMoveAnimating = false;
+let freeMoveSelectionStarting = false;
+let freeMoveTapInProgress = false;
+let debtSaleInProgress = false;
+let suppressBoardInputUntil = 0;
+let lastBoardTapIndex = null;
+let lastBoardTapAt = 0;
+let connectionInfoRef = null;
+let connectionInfoHandler = null;
+let playerPresenceRef = null;
+let presencePlayerRef = null;
+let presenceConnectionId = "";
+let hostElectionInProgress = false;
+let restoringRoomSession = false;
+
+const ROOM_SESSION_KEY = "atho_room_session";
 
 // Animasi saldo pemain disimpan secara lokal agar update Firebase tidak
 // langsung mengganti angka sebelum indikator pemasukan/pengeluaran selesai.
@@ -203,6 +218,9 @@ const els = {
   historyModalList: document.getElementById("historyModalList"),
   historyCloseBtn: document.getElementById("historyCloseBtn"),
   historyCloseTopBtn: document.getElementById("historyCloseTopBtn"),
+  disconnectOverlay: document.getElementById("disconnectOverlay"),
+  disconnectTitle: document.getElementById("disconnectTitle"),
+  disconnectText: document.getElementById("disconnectText"),
   cardOverlay: document.getElementById("cardOverlay"),
   cardPopup: document.getElementById("cardPopup"),
   cardDeckLabel: document.getElementById("cardDeckLabel"),
@@ -249,6 +267,240 @@ function cleanName(value) {
   return name || "Pemain";
 }
 
+function saveRoomSession(playerName = "") {
+  if (!roomCode || mySeat === null || !myPlayerId) return;
+
+  localStorage.setItem(ROOM_SESSION_KEY, JSON.stringify({
+    roomCode,
+    seat: Number(mySeat),
+    playerId: myPlayerId,
+    playerName: cleanName(playerName || roomState?.players?.[mySeat]?.name || "Pemain"),
+    savedAt: Date.now()
+  }));
+}
+
+function readRoomSession() {
+  try {
+    const raw = localStorage.getItem(ROOM_SESSION_KEY);
+    if (!raw) return null;
+    const session = JSON.parse(raw);
+    if (!session?.roomCode || !session?.playerId) return null;
+    return session;
+  } catch (error) {
+    console.warn("Room session tidak dapat dibaca.", error);
+    return null;
+  }
+}
+
+function clearRoomSession() {
+  localStorage.removeItem(ROOM_SESSION_KEY);
+}
+
+function getPresenceConnections(stateLike, seat) {
+  const connections = stateLike?.presence?.[seat];
+  if (!connections || typeof connections !== "object") return [];
+  return Object.keys(connections).filter(Boolean);
+}
+
+function isPlayerConnectedInState(stateLike, player) {
+  if (!player) return false;
+
+  const presenceRoot = stateLike?.presence;
+  if (presenceRoot && typeof presenceRoot === "object" && Object.keys(presenceRoot).length > 0) {
+    return getPresenceConnections(stateLike, Number(player.seat)).length > 0;
+  }
+
+  return Boolean(player.connected);
+}
+
+function isPlayerGameParticipant(player, stateLike = roomState) {
+  if (!player || player.bankrupt) return false;
+
+  if (stateLike?.status === "playing" || stateLike?.status === "finished") {
+    if (player.inGame === true) return true;
+    if (player.inGame === false) return false;
+    // Backward compatibility untuk room lama yang dibuat sebelum field inGame.
+    return Boolean(player.id);
+  }
+
+  return Boolean(player.id) && isPlayerConnectedInState(stateLike, player);
+}
+
+function getDisconnectedGamePlayers(stateLike = roomState) {
+  if (!stateLike || stateLike.status !== "playing") return [];
+
+  return Object.values(stateLike.players || {})
+    .filter(player => isPlayerGameParticipant(player, stateLike))
+    .filter(player => !isPlayerConnectedInState(stateLike, player))
+    .sort((a, b) => Number(a.seat) - Number(b.seat));
+}
+
+function isGamePausedForDisconnect(stateLike = roomState) {
+  return getDisconnectedGamePlayers(stateLike).length > 0;
+}
+
+async function configureCurrentPresence() {
+  if (!roomRef || mySeat === null || !myPlayerId || !playerPresenceRef || !presencePlayerRef) return;
+
+  const serverTimestamp = firebase.database.ServerValue.TIMESTAMP;
+
+  await playerPresenceRef.onDisconnect().remove();
+  await presencePlayerRef.onDisconnect().update({
+    connected: false,
+    disconnectedAt: serverTimestamp
+  });
+
+  await playerPresenceRef.set({
+    playerId: myPlayerId,
+    connectedAt: serverTimestamp
+  });
+
+  await presencePlayerRef.update({
+    connected: true,
+    disconnectedAt: null,
+    lastSeenAt: serverTimestamp
+  });
+}
+
+async function detachCurrentPresence({ cancelDisconnect = true } = {}) {
+  if (connectionInfoRef && connectionInfoHandler) {
+    connectionInfoRef.off("value", connectionInfoHandler);
+  }
+
+  if (cancelDisconnect) {
+    try {
+      await playerPresenceRef?.onDisconnect().cancel();
+      await presencePlayerRef?.onDisconnect().cancel();
+    } catch (error) {
+      console.warn("Gagal membatalkan handler onDisconnect.", error);
+    }
+  }
+
+  connectionInfoRef = null;
+  connectionInfoHandler = null;
+  playerPresenceRef = null;
+  presencePlayerRef = null;
+  presenceConnectionId = "";
+}
+
+async function setupCurrentPresence() {
+  await detachCurrentPresence({ cancelDisconnect: true });
+  if (!db || !roomRef || mySeat === null || !myPlayerId) return;
+
+  presenceConnectionId = `conn_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  playerPresenceRef = roomRef.child(`presence/${mySeat}/${presenceConnectionId}`);
+  presencePlayerRef = roomRef.child(`players/${mySeat}`);
+  connectionInfoRef = db.ref(".info/connected");
+
+  connectionInfoHandler = (snapshot) => {
+    if (snapshot.val() !== true) return;
+    configureCurrentPresence().catch(error => {
+      console.warn("Gagal memperbarui presence pemain.", error);
+    });
+  };
+
+  connectionInfoRef.on("value", connectionInfoHandler);
+  await configureCurrentPresence();
+}
+
+async function restoreRoomSession() {
+  if (restoringRoomSession) return;
+  const session = readRoomSession();
+  if (!session) return;
+
+  restoringRoomSession = true;
+
+  try {
+    myPlayerId = makePlayerId();
+    if (session.playerId !== myPlayerId) {
+      clearRoomSession();
+      return;
+    }
+
+    const storedRoomCode = String(session.roomCode || "").trim().toUpperCase();
+    if (!storedRoomCode) {
+      clearRoomSession();
+      return;
+    }
+
+    const candidateRoomRef = db.ref(`rooms/${storedRoomCode}`);
+    const snapshot = await candidateRoomRef.once("value");
+    const state = snapshot.val();
+
+    if (!state?.players) {
+      clearRoomSession();
+      return;
+    }
+
+    const matchingPlayer = Object.values(state.players)
+      .find(player => player?.id === myPlayerId);
+
+    if (!matchingPlayer) {
+      clearRoomSession();
+      return;
+    }
+
+    roomCode = storedRoomCode;
+    roomRef = candidateRoomRef;
+    mySeat = Number(matchingPlayer.seat);
+
+    await setupCurrentPresence();
+    saveRoomSession(matchingPlayer.name || session.playerName || "Pemain");
+    enterGameView();
+    subscribeRoom();
+  } catch (error) {
+    console.error("Gagal memulihkan room setelah refresh.", error);
+  } finally {
+    restoringRoomSession = false;
+  }
+}
+
+async function ensureLobbyHost(stateLike = roomState) {
+  if (!roomRef || hostElectionInProgress || stateLike?.status !== "lobby") return;
+
+  const connectedPlayers = Object.values(stateLike.players || {})
+    .filter(player => player?.id && isPlayerConnectedInState(stateLike, player))
+    .sort((a, b) => Number(a.seat) - Number(b.seat));
+
+  if (!connectedPlayers.length) return;
+
+  const currentHostSeat = Number(stateLike.hostSeat);
+  const currentHost = stateLike.players?.[currentHostSeat];
+  const currentHostValid = currentHost
+    && currentHost.id
+    && currentHost.isHost
+    && isPlayerConnectedInState(stateLike, currentHost);
+
+  if (currentHostValid) return;
+
+  hostElectionInProgress = true;
+
+  try {
+    await roomRef.transaction((room) => {
+      if (!room || room.status !== "lobby") return room;
+
+      const candidates = Object.values(room.players || {})
+        .filter(player => player?.id && isPlayerConnectedInState(room, player))
+        .sort((a, b) => Number(a.seat) - Number(b.seat));
+
+      if (!candidates.length) return room;
+
+      const hostSeat = Number(candidates[0].seat);
+      room.hostSeat = hostSeat;
+
+      Object.keys(room.players || {}).forEach((seatKey) => {
+        room.players[seatKey].isHost = Number(seatKey) === hostSeat;
+      });
+
+      return room;
+    });
+  } catch (error) {
+    console.warn("Pemindahan host lobby gagal.", error);
+  } finally {
+    hostElectionInProgress = false;
+  }
+}
+
 function makeInitialPropertyState() {
   const data = {};
   Object.keys(PROPERTY_DATA).forEach((id) => {
@@ -269,7 +521,11 @@ function createInitialRoom(hostName) {
       position: 0,
       inJail: false,
       jailAttempts: 0,
+      lapsCompleted: 0,
+      bankrupt: false,
+      inGame: false,
       connected: i === 0,
+      disconnectedAt: null,
       isHost: i === 0
     };
   }
@@ -285,6 +541,7 @@ function createInitialRoom(hostName) {
     lastRoulette: { id: "", result: 0, rotation: 0 },
     lastMove: null,
     pendingAction: null,
+    debtState: null,
     cardPopup: null,
     winnerSeat: null,
     propertyState: makeInitialPropertyState(),
@@ -303,6 +560,8 @@ async function createRoom() {
 
   await roomRef.set(createInitialRoom(playerName));
   mySeat = 0;
+  await setupCurrentPresence();
+  saveRoomSession(playerName);
   enterGameView();
   subscribeRoom();
 }
@@ -340,7 +599,7 @@ async function joinRoom() {
 
   if (seat === null) {
     for (let i = 0; i < 4; i++) {
-      if (!players[i]?.connected && !players[i]?.id) {
+      if (!players[i]?.id) {
         seat = i;
         break;
       }
@@ -354,13 +613,26 @@ async function joinRoom() {
 
   mySeat = seat;
 
-  await roomRef.child(`players/${seat}`).update({
+  const reconnectingExistingPlayer = players[seat]?.id === myPlayerId;
+  const playerUpdates = {
     id: myPlayerId,
     name: playerName,
-    connected: true
-  });
+    connected: true,
+    disconnectedAt: null
+  };
 
-  await addRemoteLog(`${playerName} bergabung sebagai Pemain ${seat + 1}.`);
+  if (!reconnectingExistingPlayer) {
+    playerUpdates.inGame = false;
+    playerUpdates.bankrupt = false;
+  }
+
+  await roomRef.child(`players/${seat}`).update(playerUpdates);
+  await setupCurrentPresence();
+  saveRoomSession(playerName);
+
+  if (!reconnectingExistingPlayer) {
+    await addRemoteLog(`${playerName} bergabung sebagai Pemain ${seat + 1}.`);
+  }
 
   enterGameView();
   subscribeRoom();
@@ -384,7 +656,13 @@ function subscribeRoom() {
 
   roomRef.on("value", (snap) => {
     roomState = snap.val();
-    if (!roomState) return;
+    if (!roomState) {
+      clearRoomSession();
+      renderDisconnectOverlay();
+      return;
+    }
+
+    ensureLobbyHost(roomState);
 
     if (!roomState.propertyState) {
       roomRef.child("propertyState").set(makeInitialPropertyState());
@@ -443,9 +721,16 @@ function isImportantGameLog(text) {
     "roulette penjara",
     "bergabung",
     "keluar dari game",
+    "keluar dari room",
+    "menjadi host baru",
     "game dimulai",
     "game selesai",
-    "menang"
+    "menang",
+    "putaran pertama",
+    "saldo minus",
+    "menjual properti",
+    "melunasi kekurangan",
+    "bangkrut"
   ];
 
   return importantPatterns.some(pattern => normalized.includes(pattern));
@@ -481,12 +766,30 @@ async function addRemoteLog(text) {
   await trimRemoteLogsToLatest(22);
 }
 
-function getActiveSeats() {
-  if (!roomState?.players) return [];
-  return Object.values(roomState.players)
-    .filter(player => player.connected)
+function isPlayerBoardActive(player) {
+  return Number(player?.lapsCompleted || 0) >= 1;
+}
+
+function getConnectedSeatsFromState(stateLike = roomState) {
+  if (!stateLike?.players) return [];
+  return Object.values(stateLike.players)
+    .filter(player => player?.id && !player.bankrupt && isPlayerConnectedInState(stateLike, player))
     .map(player => Number(player.seat))
     .sort((a, b) => a - b);
+}
+
+function getActiveSeatsFromState(stateLike = roomState) {
+  if (!stateLike?.players) return [];
+  return Object.values(stateLike.players)
+    .filter(player => isPlayerGameParticipant(player, stateLike))
+    .map(player => Number(player.seat))
+    .sort((a, b) => a - b);
+}
+
+function getActiveSeats() {
+  return roomState?.status === "playing"
+    ? getActiveSeatsFromState(roomState)
+    : getConnectedSeatsFromState(roomState);
 }
 
 function getNextActiveSeat(currentSeat) {
@@ -512,7 +815,10 @@ function canIRoll() {
     Number(roomState.currentSeat) === Number(mySeat) &&
     !roomState.isRolling &&
     !roomState.pendingAction &&
-    !player?.inJail
+    !roomState.debtState &&
+    !isGamePausedForDisconnect(roomState) &&
+    !player?.inJail &&
+    !player?.bankrupt
   );
 }
 
@@ -525,7 +831,10 @@ function canIUseJailAction() {
     Number(roomState.currentSeat) === Number(mySeat) &&
     !roomState.isRolling &&
     !roomState.pendingAction &&
-    player?.inJail
+    !roomState.debtState &&
+    !isGamePausedForDisconnect(roomState) &&
+    player?.inJail &&
+    !player?.bankrupt
   );
 }
 
@@ -536,26 +845,49 @@ function canIAct() {
     Number(roomState.currentSeat) === Number(mySeat) &&
     !roomState.isRolling &&
     roomState.pendingAction &&
-    Number(roomState.pendingAction.seat) === Number(mySeat)
+    Number(roomState.pendingAction.seat) === Number(mySeat) &&
+    !isGamePausedForDisconnect(roomState) &&
+    !roomState.players?.[mySeat]?.bankrupt
+  );
+}
+
+function canIResolveDebt() {
+  return (
+    roomState &&
+    roomState.status === "playing" &&
+    Number(roomState.currentSeat) === Number(mySeat) &&
+    !roomState.isRolling &&
+    !roomState.pendingAction &&
+    roomState.debtState &&
+    Number(roomState.debtState.seat) === Number(mySeat) &&
+    !isGamePausedForDisconnect(roomState) &&
+    !roomState.players?.[mySeat]?.bankrupt
   );
 }
 
 async function startGame() {
   if (!canIStart()) return;
 
-  const activeSeats = getActiveSeats();
+  const activeSeats = getConnectedSeatsFromState(roomState);
   if (activeSeats.length < 2) {
     alert("Minimal 2 pemain aktif untuk mulai game.");
     return;
   }
 
-  await roomRef.update({
+  const updates = {
     status: "playing",
     currentSeat: activeSeats[0],
     isRolling: false,
     pendingAction: null,
+    debtState: null,
     winnerSeat: null
+  };
+
+  Object.values(roomState.players || {}).forEach((player) => {
+    updates[`players/${player.seat}/inGame`] = activeSeats.includes(Number(player.seat));
   });
+
+  await roomRef.update(updates);
 
   await addRemoteLog("Game dimulai.");
 }
@@ -583,6 +915,10 @@ async function rollDice() {
   const from = Number(player.position || 0);
   const to = (from + total) % BOARD_SIZE;
   const passedStart = from + total >= BOARD_SIZE;
+  const previousLaps = Number(player.lapsCompleted || 0);
+  const nextLaps = previousLaps + (passedStart ? 1 : 0);
+  const boardActiveAfterMove = previousLaps >= 1 || passedStart;
+  const completedFirstLap = previousLaps < 1 && passedStart;
   const moveId = `${Date.now()}_${mySeat}_${Math.random().toString(16).slice(2)}`;
 
   const prevRotation = Number(roomState.lastRoulette?.rotation || 0);
@@ -612,6 +948,7 @@ async function rollDice() {
 
   updates[`players/${mySeat}/position`] = to;
   updates[`players/${mySeat}/money`] = playerMoney;
+  updates[`players/${mySeat}/lapsCompleted`] = nextLaps;
 
   const logs = [];
   logs.push(`${player.name} memutar roulette dan mendapat ${result} langkah, bergerak dari petak ${from} ke petak ${to}.`);
@@ -620,7 +957,16 @@ async function rollDice() {
     logs.push(`${player.name} melewati START dan menerima $200.`);
   }
 
-  playerMoney = applyLandingEffect(to, mySeat, playerMoney, total, updates, logs);
+  if (completedFirstLap) {
+    logs.push(`${player.name} menyelesaikan putaran pertama. Seluruh petak kini aktif untuk pemain ini.`);
+  }
+
+  // Sebelum menyelesaikan satu putaran penuh, seluruh efek petak dinonaktifkan
+  // khusus untuk pemain tersebut. Efek langsung aktif pada langkah yang pertama
+  // kali melewati START.
+  if (boardActiveAfterMove) {
+    playerMoney = applyLandingEffect(to, mySeat, playerMoney, total, updates, logs);
+  }
 
   updates[`players/${mySeat}/money`] = playerMoney;
 
@@ -633,12 +979,30 @@ async function rollDice() {
     const latest = (await roomRef.once("value")).val();
     if (!latest?.lastMove || latest.lastMove.id !== moveId) return;
 
+    const latestPlayer = latest.players?.[mySeat];
+
+    if (latest.debtState && Number(latest.debtState.seat) === Number(mySeat)) {
+      await roomRef.update({ isRolling: false });
+      return;
+    }
+
+    if (latestPlayer?.bankrupt) {
+      await roomRef.update({ isRolling: false });
+      await finishTurn();
+      return;
+    }
+
     if (latest.pendingAction) {
       await roomRef.update({ isRolling: false });
       return;
     }
 
-    const nextSeat = getNextActiveSeat(latest.currentSeat);
+    const activeSeats = getActiveSeatsFromState(latest);
+    const currentIndex = activeSeats.indexOf(Number(latest.currentSeat));
+    const nextSeat = currentIndex === -1
+      ? activeSeats[0]
+      : activeSeats[(currentIndex + 1) % activeSeats.length];
+
     await roomRef.update({
       isRolling: false,
       currentSeat: nextSeat
@@ -690,7 +1054,7 @@ function applyLandingEffect(tileIndex, seat, playerMoney, diceTotal, updates, lo
       cardId: popupId
     };
     logs.push(`${player.name} membayar pajak ${formatMoney(tile.amount)}.`);
-    return playerMoney;
+    return applyDebtRequirement(seat, playerMoney, updates, `pajak ${formatMoney(tile.amount)}`, logs);
   }
 
   if (tile.type === "free") {
@@ -785,39 +1149,56 @@ function makeFreeParkingPopup(player, pool) {
   };
 }
 
-async function beginFreeMoveSelection() {
+async function beginFreeMoveSelection(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+
   if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "freeParkingChoice") return;
 
-  const latest = (await roomRef.once("value")).val();
-  const action = latest?.pendingAction;
-  if (!latest || action?.type !== "freeParkingChoice" || Number(action.seat) !== Number(mySeat)) return;
+  suppressBoardInputUntil = Date.now() + 420;
+  freeMoveSelectionStarting = true;
 
-  const player = latest.players?.[mySeat];
-  if (!player) return;
+  try {
+    const latest = (await roomRef.once("value")).val();
+    const action = latest?.pendingAction;
+    if (!latest || action?.type !== "freeParkingChoice" || Number(action.seat) !== Number(mySeat)) return;
 
-  const eligibleIndices = getFreeMoveEligibleIndices(latest, mySeat);
-  if (!eligibleIndices.length) {
-    await roomRef.update({ pendingAction: null, cardPopup: null, isRolling: false });
-    await addRemoteLog(`${player.name} tidak memiliki petak tujuan yang menguntungkan dari Parkir Bebas.`);
-    await finishTurn();
-    return;
+    const player = latest.players?.[mySeat];
+    if (!player) return;
+
+    const eligibleIndices = getFreeMoveEligibleIndices(latest, mySeat);
+    if (!eligibleIndices.length) {
+      await roomRef.update({ pendingAction: null, cardPopup: null, isRolling: false });
+      await addRemoteLog(`${player.name} tidak memiliki petak tujuan yang menguntungkan dari Parkir Bebas.`);
+      await finishTurn();
+      return;
+    }
+
+    localHiddenCardId = latest.cardPopup?.id || localHiddenCardId;
+    els.cardOverlay.classList.add("hidden");
+
+    await roomRef.update({
+      pendingAction: {
+        type: "freeMove",
+        seat: mySeat,
+        eligibleIndices
+      },
+      cardPopup: null,
+      isRolling: false
+    });
+
+    await addRemoteLog(`${player.name} memilih bonus pindah petak dari Parkir Bebas. Petak yang menguntungkan sudah di-highlight.`);
+  } finally {
+    window.setTimeout(() => {
+      freeMoveSelectionStarting = false;
+    }, 420);
   }
-
-  localHiddenCardId = latest.cardPopup?.id || localHiddenCardId;
-  await roomRef.update({
-    pendingAction: {
-      type: "freeMove",
-      seat: mySeat,
-      eligibleIndices
-    },
-    cardPopup: null,
-    isRolling: false
-  });
-
-  await addRemoteLog(`${player.name} memilih bonus pindah petak dari Parkir Bebas. Petak yang menguntungkan sudah di-highlight.`);
 }
 
-async function collectFreeParkingTax() {
+async function collectFreeParkingTax(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  suppressBoardInputUntil = Date.now() + 420;
   if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "freeParkingChoice") return;
 
   const latest = (await roomRef.once("value")).val();
@@ -852,6 +1233,7 @@ async function chooseFreeMoveTarget(tileIndex) {
   const allowed = normalizeTileIndices(action.eligibleIndices);
   const normalizedIndex = Number(tileIndex);
   if (!allowed.includes(normalizedIndex)) return;
+  if (freeMoveTapInProgress) return;
 
   const targetTile = BOARD[normalizedIndex];
   const isBeneficialTarget = targetTile
@@ -863,6 +1245,9 @@ async function chooseFreeMoveTarget(tileIndex) {
   roomState = latest;
   const player = latest.players?.[mySeat];
   if (!player) return;
+
+  freeMoveTapInProgress = true;
+  suppressBoardInputUntil = Date.now() + 900;
 
   const currentPos = Number(player.position || 0);
   const clockwiseDistance = getClockwiseDistance(currentPos, normalizedIndex);
@@ -911,20 +1296,42 @@ async function chooseFreeMoveTarget(tileIndex) {
   );
   updates[`players/${mySeat}/money`] = playerMoney;
 
-  await roomRef.update(updates);
-  await addLogs(logs);
+  try {
+    await roomRef.update(updates);
+    await addLogs(logs);
 
-  setTimeout(async () => {
-    const current = (await roomRef.once("value")).val();
-    if (!current?.lastMove || current.lastMove.id !== moveId) return;
+    setTimeout(async () => {
+      try {
+        const current = (await roomRef.once("value")).val();
+        if (!current?.lastMove || current.lastMove.id !== moveId) return;
 
-    await roomRef.update({ isRolling: false });
+        await roomRef.update({ isRolling: false });
 
-    const afterUnlock = (await roomRef.once("value")).val();
-    if (!afterUnlock?.pendingAction) {
-      await finishTurn();
-    }
-  }, 680);
+        const afterUnlock = (await roomRef.once("value")).val();
+        if (!afterUnlock?.pendingAction) {
+          await finishTurn();
+        }
+      } finally {
+        freeMoveTapInProgress = false;
+      }
+    }, 680);
+  } catch (error) {
+    freeMoveTapInProgress = false;
+    throw error;
+  }
+}
+
+function chooseSelectedFreeMoveTarget(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+
+  const select = document.getElementById("freeMoveTargetSelect");
+  if (!select) return;
+
+  const tileIndex = Number(select.value);
+  if (!Number.isInteger(tileIndex)) return;
+
+  chooseFreeMoveTarget(tileIndex);
 }
 
 function drawAndApplyCard(tileType, seat, playerMoney, updates, logs) {
@@ -970,7 +1377,7 @@ function applyCardEffect(card, seat, playerMoney, updates, logs) {
     playerMoney -= amount;
     updates.taxPool = Number(updates.taxPool ?? roomState.taxPool ?? 0) + amount;
     logs.push(`${player.name} membayar ${formatMoney(amount)} ke Uang Pajak.`);
-    return playerMoney;
+    return applyDebtRequirement(seat, playerMoney, updates, `denda atau pajak ${formatMoney(amount)}`, logs);
   }
 
   if (effect.type === "collectTaxPool") {
@@ -1060,7 +1467,7 @@ function handlePropertyLanding(propertyId, seat, playerMoney, diceTotal, updates
   updates[`players/${ownerSeat}/money`] = ownerMoney;
 
   logs.push(`${player.name} membayar sewa ${formatMoney(rent)} kepada ${owner.name} untuk ${property.name}.`);
-  return playerMoney;
+  return applyDebtRequirement(seat, playerMoney, updates, `sewa ${property.name} sebesar ${formatMoney(rent)}`, logs);
 }
 
 async function addLogs(logs) {
@@ -1097,7 +1504,7 @@ function calculateRent(propertyId, diceTotal = 7, stateLike = roomState) {
   if (property.kind === "city") {
     let rent = property.rents[Number(ps.level || 0)] || property.rents[0];
 
-    if (Number(ps.level || 0) === 0 && hasFullGroup(ps.owner, property.group, stateLike)) {
+    if (hasFullGroup(ps.owner, property.group, stateLike)) {
       rent *= 2;
     }
 
@@ -1132,27 +1539,168 @@ function hasFullGroup(ownerSeat, group, stateLike = roomState) {
     .filter(([, item]) => item.kind === "city" && item.group === group)
     .map(([id]) => id);
 
-  return groupIds.every(id => Number(stateLike.propertyState?.[id]?.owner) === Number(ownerSeat));
+  return groupIds.every(id => {
+    const owner = stateLike.propertyState?.[id]?.owner;
+    return owner !== null && owner !== undefined && Number(owner) === Number(ownerSeat);
+  });
 }
 
 function getOwnedPropertyIds(ownerSeat, stateLike = roomState) {
   return Object.keys(PROPERTY_DATA)
-    .filter(id => Number(stateLike.propertyState?.[id]?.owner) === Number(ownerSeat));
+    .filter(id => {
+      const owner = stateLike?.propertyState?.[id]?.owner;
+      return owner !== null && owner !== undefined && Number(owner) === Number(ownerSeat);
+    });
 }
+
+function getPropertyLiquidationValue(propertyId, stateLike = roomState) {
+  const property = PROPERTY_DATA[propertyId];
+  const propertyState = stateLike?.propertyState?.[propertyId] || { level: 0 };
+  if (!property) return 0;
+
+  // Nilai jual tanah = nilai hipotik (50% dari harga beli).
+  // Seluruh rumah/hotel ikut dijual dengan nilai 50% dari total biaya bangunan.
+  const landValue = Number(property.mortgage || 0);
+  const level = property.kind === "city" ? Number(propertyState.level || 0) : 0;
+  const buildingValue = level * Number(property.buildingCost || 0) * 0.5;
+
+  return Math.floor(landValue + buildingValue);
+}
+
+function applyDebtRequirement(seat, projectedMoney, updates, reason, logs, options = {}) {
+  const money = Number(projectedMoney || 0);
+  if (money >= 0) return money;
+
+  const player = roomState?.players?.[seat];
+  const ownedIds = getOwnedPropertyIds(seat, roomState);
+  const deficit = Math.abs(money);
+
+  if (ownedIds.length > 0) {
+    updates.debtState = {
+      seat: Number(seat),
+      reason: String(reason || "kewajiban pembayaran"),
+      deficit,
+      resumeTurn: Boolean(options.resumeTurn),
+      createdAt: Date.now()
+    };
+    logs.push(`${player?.name || "Pemain"} memiliki saldo minus ${formatMoney(deficit)} dan harus menjual properti.`);
+    return money;
+  }
+
+  updates[`players/${seat}/money`] = 0;
+  updates[`players/${seat}/bankrupt`] = true;
+  updates[`players/${seat}/inJail`] = false;
+  updates[`players/${seat}/jailAttempts`] = 0;
+  updates.debtState = null;
+  updates.pendingAction = null;
+  updates.cardPopup = null;
+  updates.isRolling = false;
+  logs.push(`${player?.name || "Pemain"} bangkrut karena tidak memiliki properti untuk menutup kekurangan ${formatMoney(deficit)}.`);
+  return 0;
+}
+
+async function sellSelectedPropertyForDebt(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+
+  if (!roomRef || !canIResolveDebt() || debtSaleInProgress) return;
+
+  const select = document.getElementById("debtPropertySelect");
+  const propertyId = String(select?.value || "");
+  if (!PROPERTY_DATA[propertyId]) return;
+
+  debtSaleInProgress = true;
+
+  try {
+    const latest = (await roomRef.once("value")).val();
+    const debt = latest?.debtState;
+    const player = latest?.players?.[mySeat];
+    const propertyState = latest?.propertyState?.[propertyId];
+
+    if (!latest || !player || player.bankrupt) return;
+    if (!debt || Number(debt.seat) !== Number(mySeat)) return;
+    if (Number(propertyState?.owner) !== Number(mySeat)) return;
+
+    const saleValue = getPropertyLiquidationValue(propertyId, latest);
+    const currentMoney = Number(player.money || 0);
+    const nextMoney = currentMoney + saleValue;
+    const remainingIds = getOwnedPropertyIds(mySeat, latest).filter(id => id !== propertyId);
+    const property = PROPERTY_DATA[propertyId];
+    const updates = {
+      [`players/${mySeat}/money`]: nextMoney,
+      [`propertyState/${propertyId}/owner`]: null,
+      [`propertyState/${propertyId}/level`]: 0,
+      isRolling: false
+    };
+
+    let becameBankrupt = false;
+    let debtResolved = false;
+
+    if (nextMoney >= 0) {
+      updates.debtState = null;
+      debtResolved = true;
+    } else if (remainingIds.length > 0) {
+      updates.debtState = {
+        seat: Number(mySeat),
+        reason: debt.reason || "kewajiban pembayaran",
+        deficit: Math.abs(nextMoney),
+        resumeTurn: Boolean(debt.resumeTurn),
+        createdAt: Number(debt.createdAt || Date.now())
+      };
+    } else {
+      updates[`players/${mySeat}/money`] = 0;
+      updates[`players/${mySeat}/bankrupt`] = true;
+      updates[`players/${mySeat}/inJail`] = false;
+      updates[`players/${mySeat}/jailAttempts`] = 0;
+      updates.debtState = null;
+      updates.pendingAction = null;
+      updates.cardPopup = null;
+      becameBankrupt = true;
+    }
+
+    await roomRef.update(updates);
+    await addRemoteLog(`${player.name} menjual properti ${property.name} kepada bank seharga ${formatMoney(saleValue)}.`);
+
+    if (debtResolved) {
+      await addRemoteLog(`${player.name} melunasi kekurangan pembayaran dan memiliki saldo ${formatMoney(nextMoney)}.`);
+      if (!debt.resumeTurn) {
+        await finishTurn();
+      }
+      return;
+    }
+
+    if (becameBankrupt) {
+      await addRemoteLog(`${player.name} bangkrut setelah seluruh properti dijual tetapi saldo masih belum mencukupi.`);
+      await finishTurn();
+    }
+  } finally {
+    debtSaleInProgress = false;
+  }
+}
+
 
 async function payJailFine() {
   if (!canIUseJailAction()) return;
 
   const player = roomState.players[mySeat];
   const updates = {};
-  updates[`players/${mySeat}/money`] = Number(player.money || 0) - 50;
+  const logs = [`${player.name} membayar $50 dan bebas dari penjara. Pemain dapat langsung bermain pada giliran ini.`];
+  let nextMoney = Number(player.money || 0) - 50;
+
   updates[`players/${mySeat}/inJail`] = false;
   updates[`players/${mySeat}/jailAttempts`] = 0;
   updates.taxPool = Number(roomState.taxPool || 0) + 50;
+  nextMoney = applyDebtRequirement(mySeat, nextMoney, updates, "denda keluar penjara $50", logs, { resumeTurn: true });
+  updates[`players/${mySeat}/money`] = nextMoney;
 
   await roomRef.update(updates);
-  await addRemoteLog(`${player.name} membayar $50 dan bebas dari penjara. Pemain dapat langsung bermain pada giliran ini.`);
+  await addLogs(logs);
+
+  if (updates[`players/${mySeat}/bankrupt`]) {
+    await finishTurn();
+  }
 }
+
 
 async function rollForJailRoulette() {
   if (!canIUseJailAction()) return;
@@ -1308,29 +1856,42 @@ async function finishTurn() {
   const latest = (await roomRef.once("value")).val();
   if (!latest) return;
 
-  const activeSeats = Object.values(latest.players || {})
-    .filter(player => player.connected)
-    .map(player => Number(player.seat))
-    .sort((a, b) => a - b);
+  // Pemain yang masih memiliki saldo minus wajib menyelesaikan penjualan aset
+  // sebelum giliran dapat berpindah.
+  if (latest.debtState) {
+    await roomRef.update({ isRolling: false });
+    return;
+  }
+
+  const activeSeats = getActiveSeatsFromState(latest);
 
   if (activeSeats.length <= 1) {
-    const winnerSeat = activeSeats[0] ?? latest.currentSeat;
+    const winnerSeat = activeSeats[0] ?? null;
+    const winnerName = winnerSeat !== null
+      ? (latest.players?.[winnerSeat]?.name || "Pemain terakhir")
+      : "Tidak ada pemenang";
+
     await roomRef.update({
       status: "finished",
       winnerSeat,
       isRolling: false,
       pendingAction: null,
+      debtState: null,
       cardPopup: {
         id: `${Date.now()}_game_finished`,
         deckType: "system",
         deck: "Game Selesai",
-        title: `${latest.players[winnerSeat]?.name || "Pemain terakhir"} Menang!`,
-        text: "Semua pemain lain sudah keluar. Game dinyatakan selesai.",
+        title: winnerSeat !== null ? `${winnerName} Menang!` : "Game Selesai",
+        text: winnerSeat !== null
+          ? "Semua pemain lain sudah bangkrut atau keluar. Game dinyatakan selesai."
+          : "Tidak ada pemain aktif yang tersisa.",
         seat: winnerSeat,
-        playerName: latest.players[winnerSeat]?.name || "Pemenang"
+        playerName: winnerName
       }
     });
-    await addRemoteLog(`Game selesai. ${latest.players[winnerSeat]?.name || "Pemain terakhir"} menang.`);
+    await addRemoteLog(winnerSeat !== null
+      ? `Game selesai. ${winnerName} menang.`
+      : "Game selesai tanpa pemenang.");
     return;
   }
 
@@ -1343,15 +1904,18 @@ async function finishTurn() {
     currentSeat: nextSeat,
     isRolling: false,
     pendingAction: null,
+    debtState: null,
     cardPopup: null
   });
 
   await addRemoteLog(`Giliran berpindah ke ${latest.players[nextSeat]?.name || `Pemain ${nextSeat + 1}`}.`);
 }
 
+
 function renderUI() {
   const players = roomState.players || {};
   const current = players[roomState.currentSeat];
+  const me = players[mySeat];
 
   els.turnName.textContent = current?.name || "-";
   renderRouletteUI();
@@ -1366,6 +1930,8 @@ function renderUI() {
     els.statusText.textContent = canIStart()
       ? "Kamu host. Setelah minimal 2 pemain masuk, klik Mulai Game."
       : "Menunggu host memulai game.";
+  } else if (me?.bankrupt) {
+    els.statusText.textContent = "Kamu sudah bangkrut dan sekarang menjadi penonton. Permainan pemain lain tetap berlanjut.";
   } else if (roomState.isRolling) {
     els.statusText.textContent = current?.inJail
       ? "Roulette penjara sedang berputar. Pemain harus mendapat angka 12 untuk bebas."
@@ -1383,12 +1949,19 @@ function renderUI() {
     } else {
       els.statusText.textContent = `Menunggu aksi dari ${actor?.name || "pemain aktif"}.`;
     }
+  } else if (roomState.debtState) {
+    const debtor = players[roomState.debtState.seat];
+    els.statusText.textContent = Number(roomState.debtState.seat) === Number(mySeat)
+      ? `Saldo kamu minus. Jual properti sampai saldo kembali minimal $0.`
+      : `${debtor?.name || "Pemain aktif"} sedang menjual properti untuk menutup saldo minus.`;
   } else if (current?.inJail) {
     els.statusText.textContent = Number(roomState.currentSeat) === Number(mySeat)
       ? "Kamu sedang di penjara. Pilih bayar $50 atau coba dapatkan angka 12 dari roulette."
       : `${current?.name || "Pemain aktif"} sedang di penjara.`;
   } else if (canIRoll()) {
-    els.statusText.textContent = "Sekarang giliranmu. Klik Putar Roulette.";
+    els.statusText.textContent = isPlayerBoardActive(me)
+      ? "Sekarang giliranmu. Klik Putar Roulette."
+      : "Putaran pemanasan: selesaikan satu putaran dan lewati START agar seluruh petak aktif untukmu.";
   } else {
     els.statusText.textContent = `Menunggu giliran ${current?.name || "pemain lain"}.`;
   }
@@ -1397,6 +1970,33 @@ function renderUI() {
   renderPlayersList(players);
   renderLogs();
   renderCardPopup();
+  renderDisconnectOverlay();
+}
+
+
+function renderDisconnectOverlay() {
+  if (!els.disconnectOverlay) return;
+
+  const disconnectedPlayers = getDisconnectedGamePlayers(roomState);
+  const shouldShow = roomState?.status === "playing" && disconnectedPlayers.length > 0;
+
+  els.disconnectOverlay.classList.toggle("hidden", !shouldShow);
+  els.disconnectOverlay.setAttribute("aria-hidden", shouldShow ? "false" : "true");
+
+  if (!shouldShow) return;
+
+  const names = disconnectedPlayers.map(player => player.name || `Pemain ${Number(player.seat) + 1}`);
+  const nameText = names.length === 1
+    ? names[0]
+    : `${names.slice(0, -1).join(", ")} dan ${names[names.length - 1]}`;
+
+  if (els.disconnectTitle) {
+    els.disconnectTitle.textContent = "Permainan Dijeda";
+  }
+
+  if (els.disconnectText) {
+    els.disconnectText.textContent = `Menunggu ${nameText} terhubung kembali. Permainan akan dilanjutkan otomatis setelah koneksi pulih.`;
+  }
 }
 
 function renderActionPanel() {
@@ -1419,6 +2019,37 @@ function renderActionPanel() {
     els.actionPanel.innerHTML = `
       <div class="action-title">Lobby</div>
       <div class="action-sub">Menunggu pemain masuk. Host dapat memulai game setelah minimal 2 pemain aktif.</div>
+    `;
+    return;
+  }
+
+  if (roomState.debtState && !roomState.pendingAction && !roomState.isRolling) {
+    const debtSeat = Number(roomState.debtState.seat);
+    const debtor = roomState.players?.[debtSeat];
+    const ownedIds = getOwnedPropertyIds(debtSeat, roomState);
+    const options = ownedIds.map(propertyId => {
+      const property = PROPERTY_DATA[propertyId];
+      const saleValue = getPropertyLiquidationValue(propertyId, roomState);
+      return `<option value="${escapeHTML(propertyId)}">${escapeHTML(property.name)} (${formatMoney(saleValue)})</option>`;
+    }).join("");
+    const enabled = canIResolveDebt() && ownedIds.length > 0;
+    const currentMoney = Number(debtor?.money || 0);
+
+    els.actionPanel.innerHTML = `
+      <div class="action-title">JUAL PROPERTI</div>
+      <div class="action-sub">
+        ${escapeHTML(debtor?.name || "Pemain")} memiliki saldo ${formatMoney(currentMoney)} karena ${escapeHTML(roomState.debtState.reason || "kewajiban pembayaran")}.
+        Jual seluruh tanah beserta bangunannya sampai saldo kembali minimal $0.
+      </div>
+      <div class="price-pill">Kekurangan: ${formatMoney(Math.abs(currentMoney))}</div>
+      ${ownedIds.length ? `
+        <div class="free-move-mobile-picker debt-property-picker">
+          <select id="debtPropertySelect" aria-label="Pilih properti yang akan dijual">${options}</select>
+          <button class="danger" type="button" onclick="sellSelectedPropertyForDebt(event)" ${enabled ? "" : "disabled"}>Jual Properti</button>
+        </div>
+      ` : `
+        <div class="action-sub">Tidak ada properti yang dapat dijual. Pemain akan dinyatakan bangkrut.</div>
+      `}
     `;
     return;
   }
@@ -1453,10 +2084,18 @@ function renderActionPanel() {
   }
 
   if (!action) {
-    els.actionPanel.innerHTML = `
-      <div class="action-title">${escapeHTML(currentTileName)}</div>
-      <div class="action-sub">${myTurn ? "Tidak ada aksi khusus. Silakan putar roulette." : "Menunggu giliran pemain aktif."}</div>
-    `;
+    if (myTurn && !isPlayerBoardActive(player)) {
+      els.actionPanel.innerHTML = `
+        <div class="action-title">PUTARAN PEMANASAN</div>
+        <div class="action-sub">Seluruh efek petak belum aktif untuk ${escapeHTML(player?.name || "pemain ini")}. Lewati START satu kali untuk membuka pembelian tanah, kartu, pajak, denda, penjara, dan Parkir Bebas.</div>
+        <div class="price-pill">Putaran ${Number(player?.lapsCompleted || 0)}/1</div>
+      `;
+    } else {
+      els.actionPanel.innerHTML = `
+        <div class="action-title">${escapeHTML(currentTileName)}</div>
+        <div class="action-sub">${myTurn ? "Tidak ada aksi khusus. Silakan putar roulette." : "Menunggu giliran pemain aktif."}</div>
+      `;
+    }
     return;
   }
 
@@ -1484,18 +2123,29 @@ function renderActionPanel() {
       <div class="action-sub">Pilih satu hadiah. Mengambil Uang Pajak akan mengakhiri giliran. Memilih petak akan menampilkan highlight pada tanah kosong, tanah milikmu, Dana Umum, dan Kesempatan.</div>
       <div class="price-pill">Uang Pajak: ${formatMoney(pool)} • ${totalChoices} petak menguntungkan</div>
       <div class="action-row">
-        <button class="gold" onclick="collectFreeParkingTax()" ${enabled && pool > 0 ? "" : "disabled"}>Ambil Uang Pajak</button>
-        <button class="primary" onclick="beginFreeMoveSelection()" ${enabled && totalChoices > 0 ? "" : "disabled"}>Pilih Petak Tujuan</button>
+        <button class="gold" onclick="collectFreeParkingTax(event)" ${enabled && pool > 0 ? "" : "disabled"}>Ambil Uang Pajak</button>
+        <button class="primary" onclick="beginFreeMoveSelection(event)" ${enabled && totalChoices > 0 ? "" : "disabled"}>Pilih Petak Tujuan</button>
       </div>
     `;
     return;
   }
 
   if (action.type === "freeMove") {
-    const totalChoices = normalizeTileIndices(action.eligibleIndices).length;
+    const eligibleIndices = normalizeTileIndices(action.eligibleIndices);
+    const totalChoices = eligibleIndices.length;
+    const actorPosition = Number(roomState.players?.[action.seat]?.position ?? 20);
+    const options = eligibleIndices.map((tileIndex) => {
+      const bonusLabel = doesClockwiseMovePassStart(actorPosition, tileIndex) ? " (+$200)" : "";
+      return `<option value="${tileIndex}">${escapeHTML(getTileName(BOARD[tileIndex]))}${bonusLabel}</option>`;
+    }).join("");
+
     els.actionPanel.innerHTML = `
       <div class="action-title">PILIH PETAK TUJUAN</div>
-      <div class="action-sub">Klik salah satu petak yang di-highlight kuning. Petak tujuan yang rutenya melewati START memberi bonus $200. Petak lawan, pajak, penjara, Masuk Penjara, START, dan Parkir Bebas tidak dapat dipilih. Pilihan tersedia: ${totalChoices} petak.</div>
+      <div class="action-sub">Tap salah satu petak yang di-highlight kuning. Petak tujuan yang rutenya melewati START memberi bonus $200. Pilihan tersedia: ${totalChoices} petak.</div>
+      <div class="free-move-mobile-picker">
+        <select id="freeMoveTargetSelect" aria-label="Pilih petak tujuan Parkir Bebas">${options}</select>
+        <button class="primary" type="button" onclick="chooseSelectedFreeMoveTarget(event)">Pindah ke Petak</button>
+      </div>
     `;
     return;
   }
@@ -1767,7 +2417,7 @@ function createPlayerRow(seat) {
 
 function renderPlayersList(players) {
   const visiblePlayers = Object.values(players)
-    .filter(player => player.connected)
+    .filter(player => player?.id || player.bankrupt || isPlayerConnectedInState(roomState, player))
     .sort((a, b) => Number(a.seat) - Number(b.seat));
   const visibleSeats = new Set(visiblePlayers.map(player => Number(player.seat)));
 
@@ -1802,7 +2452,10 @@ function renderPlayersList(players) {
       return `<span class="owned-tag">${escapeHTML(property.name)}${level}</span>`;
     }).join("");
 
-    row.classList.toggle("active", seat === Number(roomState.currentSeat));
+    const playerConnected = isPlayerConnectedInState(roomState, player);
+    row.classList.toggle("active", seat === Number(roomState.currentSeat) && !player.bankrupt);
+    row.classList.toggle("bankrupt", Boolean(player.bankrupt));
+    row.classList.toggle("disconnected", !playerConnected && !player.bankrupt);
 
     const dot = row.querySelector('[data-role="dot"]');
     const name = row.querySelector('[data-role="name"]');
@@ -1811,9 +2464,19 @@ function renderPlayersList(players) {
 
     dot.style.background = player.color;
     dot.textContent = String(seat + 1);
-    name.textContent = player.name;
-    sub.textContent = `Petak ${player.position || 0} • ${player.connected ? "Online" : "Kosong"} • Tanah ${ownedIds.length}${player.inJail ? ` • Penjara ${Number(player.jailAttempts || 0)}/3` : ""}`;
-    owned.innerHTML = ownedTags || `<span class="owned-tag">Belum punya tanah</span>`;
+    name.textContent = player.bankrupt ? `${player.name} • BANGKRUT` : player.name;
+
+    if (player.bankrupt) {
+      sub.textContent = `Penonton • Tanah ${ownedIds.length}`;
+      owned.innerHTML = `<span class="owned-tag bankrupt-tag">BANGKRUT — hanya menonton</span>`;
+    } else {
+      const activationText = isPlayerBoardActive(player)
+        ? `Aktif • Putaran ${Number(player.lapsCompleted || 0)}`
+        : "Belum aktif • Putaran 0/1";
+      const connectionText = playerConnected ? "Online" : "Offline — menunggu kembali";
+      sub.textContent = `Petak ${player.position || 0} • ${connectionText} • ${activationText} • Tanah ${ownedIds.length}${player.inJail ? ` • Penjara ${Number(player.jailAttempts || 0)}/3` : ""}`;
+      owned.innerHTML = ownedTags || `<span class="owned-tag">Belum punya tanah</span>`;
+    }
 
     const moneyState = queuePlayerMoneyChange(seat, player.money);
     setDisplayedPlayerMoney(seat, moneyState.displayed);
@@ -1897,10 +2560,10 @@ function renderCardPopup() {
     const totalChoices = normalizeTileIndices(roomState.pendingAction?.eligibleIndices).length;
     els.cardActions.classList.remove("hidden");
     els.cardActions.innerHTML = `
-      <button class="gold" type="button" onclick="collectFreeParkingTax()" ${isActor && pool > 0 ? "" : "disabled"}>
+      <button class="gold" type="button" onclick="collectFreeParkingTax(event)" ${isActor && pool > 0 ? "" : "disabled"}>
         Ambil Uang Pajak ${formatMoney(pool)}
       </button>
-      <button class="primary" type="button" onclick="beginFreeMoveSelection()" ${isActor && totalChoices > 0 ? "" : "disabled"}>
+      <button class="primary" type="button" onclick="beginFreeMoveSelection(event)" ${isActor && totalChoices > 0 ? "" : "disabled"}>
         Pilih Petak Tujuan
       </button>
     `;
@@ -2027,6 +2690,15 @@ async function closeCardAndFinishTurn() {
 }
 
 function showPropertyDetailPopup(propertyId) {
+  const actionType = roomState?.pendingAction?.type;
+  if (Date.now() < suppressBoardInputUntil
+    || freeMoveSelectionStarting
+    || actionType === "freeParkingChoice"
+    || actionType === "freeMove"
+    || actionType === "cardFreeParking") {
+    return;
+  }
+
   const property = PROPERTY_DATA[propertyId];
   if (!property) return;
 
@@ -2046,10 +2718,12 @@ function showPropertyDetailPopup(propertyId) {
   els.cardTitle.textContent = property.name;
 
   if (property.kind === "city") {
+    const hasComplexBonus = Boolean(owner && hasFullGroup(ps.owner, property.group, roomState));
+    const rentMultiplier = hasComplexBonus ? 2 : 1;
     els.cardText.innerHTML = `
-      <div class="detail-card-meta">Harga tanah <strong>${formatMoney(price)}</strong> • Hipotik <strong>${formatMoney(property.mortgage)}</strong></div>
+      <div class="detail-card-meta">Harga tanah <strong>${formatMoney(price)}</strong> • Hipotik <strong>${formatMoney(property.mortgage)}</strong>${hasComplexBonus ? " • Kompleks lengkap: sewa ×2" : ""}</div>
       <table class="popup-rent-table">
-        ${property.rents.map((rent, index) => `<tr><td>${RENT_LABELS[index]}</td><td>${formatMoney(rent)}</td></tr>`).join("")}
+        ${property.rents.map((rent, index) => `<tr><td>${RENT_LABELS[index]}</td><td>${formatMoney(rent * rentMultiplier)}</td></tr>`).join("")}
         <tr><td>Harga bangunan</td><td>${formatMoney(property.buildingCost)}</td></tr>
         <tr><td>Level saat ini</td><td>${RENT_LABELS[Number(ps.level || 0)]}</td></tr>
         <tr><td>Sewa saat ini</td><td>${owner ? formatMoney(currentRent) : "-"}</td></tr>
@@ -2146,6 +2820,81 @@ class BoardScene extends Phaser.Scene {
       this.drawBoard();
       if (roomState) this.renderRoomState(roomState);
     });
+
+    this.installMobileBoardTapFallback();
+  }
+
+  installMobileBoardTapFallback() {
+    const canvas = this.game?.canvas;
+    if (!canvas || this.mobileTouchEndHandler) return;
+
+    this.mobileTouchEndHandler = (event) => {
+      if (roomState?.pendingAction?.type !== "freeMove") return;
+      const touch = event.changedTouches?.[0];
+      if (!touch) return;
+
+      const tileIndex = this.getTileIndexFromClientPoint(touch.clientX, touch.clientY);
+      if (tileIndex === null) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      this.handleTileTap(tileIndex);
+    };
+
+    canvas.addEventListener("touchend", this.mobileTouchEndHandler, { passive: false });
+
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      canvas.removeEventListener("touchend", this.mobileTouchEndHandler);
+      this.mobileTouchEndHandler = null;
+    });
+  }
+
+  getTileIndexFromClientPoint(clientX, clientY) {
+    const canvas = this.game?.canvas;
+    if (!canvas || !this.tiles?.length) return null;
+
+    const bounds = canvas.getBoundingClientRect();
+    if (!bounds.width || !bounds.height) return null;
+
+    const sceneX = (clientX - bounds.left) * (this.scale.width / bounds.width);
+    const sceneY = (clientY - bounds.top) * (this.scale.height / bounds.height);
+    const half = this.tileSize * 0.53;
+
+    const hit = this.tiles.find((tileObj) => (
+      Math.abs(sceneX - tileObj.x) <= half
+      && Math.abs(sceneY - tileObj.y) <= half
+    ));
+
+    return hit ? hit.index : null;
+  }
+
+  handleTileTap(tileIndex) {
+    const now = Date.now();
+    if (now < suppressBoardInputUntil || freeMoveSelectionStarting) return;
+    if (lastBoardTapIndex === tileIndex && now - lastBoardTapAt < 450) return;
+
+    lastBoardTapIndex = tileIndex;
+    lastBoardTapAt = now;
+
+    const boardTile = BOARD[tileIndex];
+    const actionType = roomState?.pendingAction?.type;
+
+    if (actionType === "freeParkingChoice" || actionType === "cardFreeParking") {
+      return;
+    }
+
+    if (actionType === "freeMove") {
+      const allowed = normalizeTileIndices(roomState.pendingAction?.eligibleIndices);
+      if (allowed.includes(Number(tileIndex))
+        && Number(roomState.pendingAction?.seat) === Number(mySeat)) {
+        chooseFreeMoveTarget(Number(tileIndex));
+      }
+      return;
+    }
+
+    if (boardTile?.type === "property") {
+      showPropertyDetailPopup(boardTile.propertyId);
+    }
   }
 
   drawBoard() {
@@ -2246,18 +2995,8 @@ class BoardScene extends Phaser.Scene {
       const rect = this.add.rectangle(x, y, tile - 2, tile - 2, this.getTileColor(i));
       rect.setStrokeStyle(1.3, 0x14213d);
       rect.setInteractive({ useHandCursor: true });
-      rect.on("pointerdown", () => {
-        if (roomState?.pendingAction?.type === "freeMove") {
-          const allowed = normalizeTileIndices(roomState.pendingAction.eligibleIndices);
-          if (allowed.includes(i) && Number(roomState.pendingAction.seat) === Number(mySeat)) {
-            chooseFreeMoveTarget(i);
-            return;
-          }
-          return;
-        }
-        if (boardTile.type === "property") {
-          showPropertyDetailPopup(boardTile.propertyId);
-        }
+      rect.on("pointerup", () => {
+        this.handleTileTap(i);
       });
 
       let colorBand = null;
@@ -2283,7 +3022,7 @@ class BoardScene extends Phaser.Scene {
       highlight.setDepth(52);
       highlight.setVisible(false);
 
-      const startBonusBadge = this.add.text(x, y + tile * .30, "+$200", {
+      const startBonusBadge = this.add.text(x, y - tile * .235, "+$200", {
         fontFamily: "Arial",
         fontSize: `${Math.max(7, Math.floor(tile * .13))}px`,
         fontStyle: "bold",
@@ -2436,16 +3175,22 @@ class BoardScene extends Phaser.Scene {
 
     Object.entries(this.pawns).forEach(([seat, pawn]) => {
       const player = state.players?.[seat];
-      if (!player?.connected) pawn.setVisible(false);
+      const shouldShow = state.status === "lobby"
+        ? Boolean(player && isPlayerConnectedInState(state, player) && !player.bankrupt)
+        : Boolean(player && isPlayerGameParticipant(player, state) && !player.bankrupt);
+      pawn.setVisible(shouldShow);
     });
 
     Object.values(state.players || {})
-      .filter(player => player.connected)
+      .filter(player => state.status === "lobby"
+        ? isPlayerConnectedInState(state, player) && !player.bankrupt
+        : isPlayerGameParticipant(player, state) && !player.bankrupt)
       .forEach(player => {
         const seat = Number(player.seat);
         const position = Number(player.position || 0);
         this.ensurePawn(player);
         this.pawns[seat].setVisible(true);
+        this.pawns[seat].setAlpha(isPlayerConnectedInState(state, player) ? 1 : 0.55);
         if (!this.animatingSeats.has(seat)) {
           this.setPawnPosition(seat, position, false);
         }
@@ -2797,61 +3542,106 @@ async function leaveRoom() {
 
   const latest = (await roomRef.once("value")).val();
   const leavingPlayer = latest?.players?.[mySeat];
-  const activeBefore = Object.values(latest?.players || {})
-    .filter(player => player.connected)
-    .map(player => Number(player.seat));
-  const remaining = activeBefore.filter(seat => seat !== Number(mySeat));
   const updates = {};
+
+  const participantSeats = getActiveSeatsFromState(latest);
+  const remainingParticipants = participantSeats.filter(seat => seat !== Number(mySeat));
 
   updates[`players/${mySeat}/connected`] = false;
   updates[`players/${mySeat}/id`] = "";
+  updates[`players/${mySeat}/inGame`] = false;
+  updates[`players/${mySeat}/isHost`] = false;
+  updates[`players/${mySeat}/disconnectedAt`] = firebase.database.ServerValue.TIMESTAMP;
+  updates[`presence/${mySeat}`] = null;
 
-  if (latest?.status === "playing" && remaining.length === 1) {
-    const winnerSeat = remaining[0];
-    updates.status = "finished";
-    updates.winnerSeat = winnerSeat;
-    updates.isRolling = false;
-    updates.pendingAction = null;
-    updates.currentSeat = winnerSeat;
-    updates.cardPopup = {
-      id: `${Date.now()}_game_finished_leave`,
-      deckType: "system",
-      deck: "Game Selesai",
-      title: `${latest.players[winnerSeat]?.name || "Pemain terakhir"} Menang!`,
-      text: `${leavingPlayer?.name || "Seorang pemain"} keluar. Karena hanya tersisa satu pemain, game dinyatakan selesai.`,
-      seat: winnerSeat,
-      playerName: latest.players[winnerSeat]?.name || "Pemenang"
-    };
-  } else if (latest?.status === "playing" && remaining.length > 1) {
-    if (Number(latest.currentSeat) === Number(mySeat)) {
-      updates.currentSeat = remaining[0];
+  let newHostName = "";
+
+  if (latest?.status === "lobby") {
+    const remainingConnectedPlayers = Object.values(latest.players || {})
+      .filter(player => Number(player.seat) !== Number(mySeat))
+      .filter(player => player?.id && isPlayerConnectedInState(latest, player))
+      .sort((a, b) => Number(a.seat) - Number(b.seat));
+
+    const newHostSeat = remainingConnectedPlayers.length
+      ? Number(remainingConnectedPlayers[0].seat)
+      : null;
+
+    updates.hostSeat = newHostSeat;
+    Object.values(latest.players || {}).forEach((player) => {
+      updates[`players/${player.seat}/isHost`] = newHostSeat !== null
+        && Number(player.seat) === newHostSeat;
+    });
+
+    if (newHostSeat !== null) {
+      newHostName = latest.players?.[newHostSeat]?.name || `Pemain ${newHostSeat + 1}`;
     }
+  } else if (latest?.status === "playing" && isPlayerGameParticipant(leavingPlayer, latest)) {
+    if (remainingParticipants.length <= 1) {
+      const winnerSeat = remainingParticipants[0] ?? null;
+      const winnerName = winnerSeat !== null
+        ? (latest.players?.[winnerSeat]?.name || "Pemain terakhir")
+        : "Tidak ada pemenang";
 
-    if (latest.pendingAction && Number(latest.pendingAction.seat) === Number(mySeat)) {
-      updates.pendingAction = null;
+      updates.status = "finished";
+      updates.winnerSeat = winnerSeat;
       updates.isRolling = false;
-    }
+      updates.pendingAction = null;
+      updates.debtState = null;
+      updates.currentSeat = winnerSeat;
+      updates.cardPopup = {
+        id: `${Date.now()}_game_finished_leave`,
+        deckType: "system",
+        deck: "Game Selesai",
+        title: winnerSeat !== null ? `${winnerName} Menang!` : "Game Selesai",
+        text: `${leavingPlayer?.name || "Seorang pemain"} keluar dari permainan.`,
+        seat: winnerSeat,
+        playerName: winnerName
+      };
+    } else {
+      if (Number(latest.currentSeat) === Number(mySeat)) {
+        const sorted = [...remainingParticipants].sort((a, b) => a - b);
+        const nextSeat = sorted.find(seat => seat > Number(mySeat)) ?? sorted[0];
+        updates.currentSeat = nextSeat;
+      }
 
-    updates.cardPopup = {
-      id: `${Date.now()}_player_left_${mySeat}`,
-      deckType: "system",
-      deck: "Info Game",
-      title: `${leavingPlayer?.name || "Pemain"} Keluar`,
-      text: `Permainan tetap berlanjut dengan ${remaining.length} pemain aktif.`,
-      seat: mySeat,
-      playerName: leavingPlayer?.name || "Pemain"
-    };
+      if (latest.pendingAction && Number(latest.pendingAction.seat) === Number(mySeat)) {
+        updates.pendingAction = null;
+        updates.isRolling = false;
+      }
+
+      if (latest.debtState && Number(latest.debtState.seat) === Number(mySeat)) {
+        updates.debtState = null;
+        updates.isRolling = false;
+      }
+
+      updates.cardPopup = {
+        id: `${Date.now()}_player_left_${mySeat}`,
+        deckType: "system",
+        deck: "Info Game",
+        title: `${leavingPlayer?.name || "Pemain"} Keluar`,
+        text: `Permainan tetap berlanjut dengan ${remainingParticipants.length} pemain.`,
+        seat: mySeat,
+        playerName: leavingPlayer?.name || "Pemain"
+      };
+    }
   }
 
+  await detachCurrentPresence({ cancelDisconnect: true });
   await roomRef.update(updates);
-  await addRemoteLog(`${leavingPlayer?.name || "Pemain"} keluar dari game.`);
+
+  const leaveLog = latest?.status === "lobby" && newHostName
+    ? `${leavingPlayer?.name || "Pemain"} keluar dari room. ${newHostName} menjadi host baru.`
+    : `${leavingPlayer?.name || "Pemain"} keluar dari game.`;
+  await addRemoteLog(leaveLog);
 
   roomRef.off();
   roomRef = null;
   roomState = null;
   roomCode = "";
   mySeat = null;
+  clearRoomSession();
   resetPlayerMoneyAnimations();
+  renderDisconnectOverlay();
 
   els.setupPanel.classList.remove("hidden");
   els.gamePanel.classList.add("hidden");
@@ -2866,6 +3656,8 @@ els.startBtn.addEventListener("click", startGame);
 window.chooseFreeMoveTarget = chooseFreeMoveTarget;
 window.beginFreeMoveSelection = beginFreeMoveSelection;
 window.collectFreeParkingTax = collectFreeParkingTax;
+window.chooseSelectedFreeMoveTarget = chooseSelectedFreeMoveTarget;
+window.sellSelectedPropertyForDebt = sellSelectedPropertyForDebt;
 els.rollBtn.addEventListener("click", rollDice);
 els.copyRoomBtn.addEventListener("click", copyRoomCode);
 els.leaveBtn.addEventListener("click", leaveRoom);
@@ -2887,10 +3679,5 @@ els.cardContinueBtn.addEventListener("click", closeCardAndFinishTurn);
 document.addEventListener("pointerdown", unlockMoneyAudio, { passive: true });
 document.addEventListener("keydown", unlockMoneyAudio);
 
-window.addEventListener("beforeunload", () => {
-  if (roomRef && mySeat !== null) {
-    roomRef.child(`players/${mySeat}/connected`).set(false);
-  }
-});
-
 initFirebase();
+restoreRoomSession();
