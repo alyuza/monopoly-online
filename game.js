@@ -521,6 +521,7 @@ function createInitialRoom(hostName) {
       position: 0,
       inJail: false,
       jailAttempts: 0,
+      roulette12Streak: 0,
       lapsCompleted: 0,
       bankrupt: false,
       inGame: false,
@@ -541,6 +542,7 @@ function createInitialRoom(hostName) {
     lastRoulette: { id: "", result: 0, rotation: 0 },
     lastMove: null,
     pendingAction: null,
+    pendingExtraRoll: null,
     debtState: null,
     cardPopup: null,
     winnerSeat: null,
@@ -719,6 +721,7 @@ function isImportantGameLog(text) {
     "masuk penjara",
     "bebas dari penjara",
     "roulette penjara",
+    "roulette 12",
     "bergabung",
     "keluar dari game",
     "keluar dari room",
@@ -879,12 +882,14 @@ async function startGame() {
     currentSeat: activeSeats[0],
     isRolling: false,
     pendingAction: null,
+    pendingExtraRoll: null,
     debtState: null,
     winnerSeat: null
   };
 
   Object.values(roomState.players || {}).forEach((player) => {
     updates[`players/${player.seat}/inGame`] = activeSeats.includes(Number(player.seat));
+    updates[`players/${player.seat}/roulette12Streak`] = 0;
   });
 
   await roomRef.update(updates);
@@ -906,23 +911,162 @@ function getRouletteFinalRotation(previousRotation, result, fullTurns = 5) {
   return currentRotation + (360 * fullTurns) + alignmentDelta;
 }
 
+function makeRoulette12BonusPopup(player, streak) {
+  const isSecond = Number(streak) >= 2;
+
+  return {
+    id: `${Date.now()}_${player.seat}_roulette12_bonus_${streak}_${Math.random().toString(16).slice(2)}`,
+    deckType: "system",
+    deck: "Bonus Roulette",
+    title: isSecond ? "ROULETTE 12 LAGI!" : "ROULETTE 12!",
+    text: isSecond
+      ? `${player.name} mendapat angka 12 untuk kedua kalinya berturut-turut. Putar lagi, tetapi jika kembali mendapat 12 maka pemain masuk penjara.`
+      : `${player.name} mendapat angka 12 dan memperoleh satu kesempatan roulette tambahan.`,
+    seat: Number(player.seat),
+    playerName: player.name
+  };
+}
+
+function makeTripleTwelveJailPopup(player) {
+  return {
+    id: `${Date.now()}_${player.seat}_roulette12_triple_jail_${Math.random().toString(16).slice(2)}`,
+    deckType: "system",
+    deck: "Aturan Roulette",
+    title: "TIGA KALI ROULETTE 12!",
+    text: `${player.name} mendapat angka 12 sebanyak tiga kali berturut-turut dan langsung masuk penjara.`,
+    seat: Number(player.seat),
+    playerName: player.name
+  };
+}
+
+async function activatePendingRoulette12Bonus(latest) {
+  const pending = latest?.pendingExtraRoll;
+  if (!pending) return false;
+
+  const seat = Number(pending.seat);
+  const player = latest.players?.[seat];
+  const staleOrInvalid = !player
+    || Number(latest.currentSeat) !== seat
+    || player.bankrupt
+    || player.inJail
+    || !player.inGame;
+
+  if (staleOrInvalid) {
+    const cleanup = { pendingExtraRoll: null };
+    if (player && (player.bankrupt || player.inJail)) {
+      cleanup[`players/${seat}/roulette12Streak`] = 0;
+    }
+    await roomRef.update(cleanup);
+    return false;
+  }
+
+  const streak = Math.max(1, Math.min(2, Number(pending.streak || 1)));
+  await roomRef.update({
+    isRolling: false,
+    pendingExtraRoll: null,
+    pendingAction: {
+      type: "roulette12Bonus",
+      seat,
+      streak
+    },
+    cardPopup: makeRoulette12BonusPopup(player, streak)
+  });
+
+  const suffix = streak >= 2
+    ? "untuk kedua kalinya berturut-turut dan mendapat satu giliran roulette tambahan."
+    : "dan mendapat satu giliran roulette tambahan.";
+  await addRemoteLog(`${player.name} mendapat roulette 12 ${suffix}`);
+  return true;
+}
+
+async function acceptRoulette12Bonus(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+
+  if (!roomRef || !canIAct() || roomState?.pendingAction?.type !== "roulette12Bonus") return;
+
+  const latest = (await roomRef.once("value")).val();
+  const action = latest?.pendingAction;
+  if (!latest || action?.type !== "roulette12Bonus" || Number(action.seat) !== Number(mySeat)) return;
+
+  localHiddenCardId = latest.cardPopup?.id || localHiddenCardId;
+  await roomRef.update({
+    pendingAction: null,
+    cardPopup: null,
+    isRolling: false
+  });
+}
+
 async function rollDice() {
   if (!canIRoll()) return;
 
   const player = roomState.players[mySeat];
   const result = Math.floor(Math.random() * 12) + 1;
-  const total = result;
+  const currentStreak = Number(player.roulette12Streak || 0);
+  const nextStreak = result === 12 ? currentStreak + 1 : 0;
+  const isThirdConsecutiveTwelve = result === 12 && nextStreak >= 3;
   const from = Number(player.position || 0);
+  const moveId = `${Date.now()}_${mySeat}_${Math.random().toString(16).slice(2)}`;
+  const prevRotation = Number(roomState.lastRoulette?.rotation || 0);
+  const rotation = getRouletteFinalRotation(prevRotation, result);
+
+  // Angka 12 ketiga tidak menjalankan perpindahan normal. Pemain langsung
+  // dipindahkan ke penjara dan rantai roulette 12 di-reset.
+  if (isThirdConsecutiveTwelve) {
+    const popup = makeTripleTwelveJailPopup(player);
+    const updates = {
+      isRolling: true,
+      lastDice: [0, result],
+      lastRoulette: {
+        id: moveId,
+        result,
+        rotation,
+        createdAt: Date.now(),
+        source: "triple-roulette-12"
+      },
+      lastMove: {
+        id: moveId,
+        seat: mySeat,
+        from,
+        to: 10,
+        steps: 0,
+        direct: true,
+        duration: 760,
+        createdAt: Date.now()
+      },
+      pendingExtraRoll: null,
+      pendingAction: {
+        type: "tripleTwelveJail",
+        seat: mySeat,
+        streak: 3,
+        moveId
+      },
+      cardPopup: popup
+    };
+
+    updates[`players/${mySeat}/position`] = 10;
+    updates[`players/${mySeat}/inJail`] = true;
+    updates[`players/${mySeat}/jailAttempts`] = 0;
+    updates[`players/${mySeat}/roulette12Streak`] = 0;
+
+    await roomRef.update(updates);
+    await addRemoteLog(`${player.name} mendapat roulette 12 tiga kali berturut-turut dan masuk penjara.`);
+
+    setTimeout(async () => {
+      const latest = (await roomRef.once("value")).val();
+      if (!latest?.lastRoulette || latest.lastRoulette.id !== moveId) return;
+      await roomRef.update({ isRolling: false });
+    }, 1650);
+    return;
+  }
+
+  const total = result;
   const to = (from + total) % BOARD_SIZE;
   const passedStart = from + total >= BOARD_SIZE;
   const previousLaps = Number(player.lapsCompleted || 0);
   const nextLaps = previousLaps + (passedStart ? 1 : 0);
   const boardActiveAfterMove = previousLaps >= 1 || passedStart;
   const completedFirstLap = previousLaps < 1 && passedStart;
-  const moveId = `${Date.now()}_${mySeat}_${Math.random().toString(16).slice(2)}`;
-
-  const prevRotation = Number(roomState.lastRoulette?.rotation || 0);
-  const rotation = getRouletteFinalRotation(prevRotation, result);
 
   let playerMoney = Number(player.money || 0) + (passedStart ? PASS_START_BONUS : 0);
   const updates = {
@@ -943,12 +1087,21 @@ async function rollDice() {
       dice: [0, result],
       createdAt: Date.now()
     },
-    pendingAction: null
+    pendingAction: null,
+    pendingExtraRoll: result === 12
+      ? {
+          seat: mySeat,
+          streak: nextStreak,
+          moveId,
+          createdAt: Date.now()
+        }
+      : null
   };
 
   updates[`players/${mySeat}/position`] = to;
   updates[`players/${mySeat}/money`] = playerMoney;
   updates[`players/${mySeat}/lapsCompleted`] = nextLaps;
+  updates[`players/${mySeat}/roulette12Streak`] = nextStreak;
 
   const logs = [];
   logs.push(`${player.name} memutar roulette dan mendapat ${result} langkah, bergerak dari petak ${from} ke petak ${to}.`);
@@ -997,18 +1150,8 @@ async function rollDice() {
       return;
     }
 
-    const activeSeats = getActiveSeatsFromState(latest);
-    const currentIndex = activeSeats.indexOf(Number(latest.currentSeat));
-    const nextSeat = currentIndex === -1
-      ? activeSeats[0]
-      : activeSeats[(currentIndex + 1) % activeSeats.length];
-
-    await roomRef.update({
-      isRolling: false,
-      currentSeat: nextSeat
-    });
-
-    await addRemoteLog(`Giliran berpindah ke ${latest.players[nextSeat]?.name || `Pemain ${nextSeat + 1}`}.`);
+    await roomRef.update({ isRolling: false });
+    await finishTurn();
   }, animationMs);
 }
 
@@ -1863,6 +2006,12 @@ async function finishTurn() {
     return;
   }
 
+  // Roulette 12 pertama atau kedua memberi satu putaran tambahan setelah
+  // seluruh efek petak dan transaksi pada langkah tersebut selesai.
+  if (await activatePendingRoulette12Bonus(latest)) {
+    return;
+  }
+
   const activeSeats = getActiveSeatsFromState(latest);
 
   if (activeSeats.length <= 1) {
@@ -1876,6 +2025,7 @@ async function finishTurn() {
       winnerSeat,
       isRolling: false,
       pendingAction: null,
+      pendingExtraRoll: null,
       debtState: null,
       cardPopup: {
         id: `${Date.now()}_game_finished`,
@@ -1904,6 +2054,7 @@ async function finishTurn() {
     currentSeat: nextSeat,
     isRolling: false,
     pendingAction: null,
+    pendingExtraRoll: null,
     debtState: null,
     cardPopup: null
   });
@@ -1946,6 +2097,12 @@ function renderUI() {
       els.statusText.textContent = Number(roomState.currentSeat) === Number(mySeat)
         ? "Klik salah satu petak yang di-highlight kuning."
         : `${actor?.name || "Pemain aktif"} sedang memilih petak tujuan dari Parkir Bebas.`;
+    } else if (roomState.pendingAction.type === "roulette12Bonus") {
+      els.statusText.textContent = Number(roomState.currentSeat) === Number(mySeat)
+        ? "Kamu mendapat angka 12. Tutup popup lalu putar roulette lagi."
+        : `${actor?.name || "Pemain aktif"} mendapat bonus roulette karena memperoleh angka 12.`;
+    } else if (roomState.pendingAction.type === "tripleTwelveJail") {
+      els.statusText.textContent = `${actor?.name || "Pemain aktif"} mendapat angka 12 tiga kali berturut-turut dan masuk penjara.`;
     } else {
       els.statusText.textContent = `Menunggu aksi dari ${actor?.name || "pemain aktif"}.`;
     }
@@ -2101,6 +2258,29 @@ function renderActionPanel() {
 
   const actor = roomState.players[action.seat];
   const enabled = canIAct();
+
+  if (action.type === "roulette12Bonus") {
+    const streak = Number(action.streak || 1);
+    els.actionPanel.innerHTML = `
+      <div class="action-title">ROULETTE 12${streak >= 2 ? " LAGI" : ""}!</div>
+      <div class="action-sub">${escapeHTML(actor?.name || "Pemain aktif")} mendapat satu kesempatan roulette tambahan.${streak >= 2 ? " Jika kembali mendapat angka 12, pemain langsung masuk penjara." : ""}</div>
+      <div class="action-row single">
+        <button class="primary" onclick="acceptRoulette12Bonus(event)" ${enabled ? "" : "disabled"}>Putar Lagi</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (action.type === "tripleTwelveJail") {
+    els.actionPanel.innerHTML = `
+      <div class="action-title">MASUK PENJARA</div>
+      <div class="action-sub">${escapeHTML(actor?.name || "Pemain aktif")} mendapat angka 12 tiga kali berturut-turut dan langsung dipindahkan ke penjara.</div>
+      <div class="action-row single">
+        <button class="primary" onclick="closeCardAndFinishTurn()" ${enabled ? "" : "disabled"}>Tutup & Lanjutkan</button>
+      </div>
+    `;
+    return;
+  }
 
   if (action.type === "card" || action.type === "taxPopup") {
     const popup = roomState.cardPopup;
@@ -2548,12 +2728,24 @@ function renderCardPopup() {
   els.cardText.textContent = popup.text || "";
 
   const actionType = roomState.pendingAction?.type;
-  const isBlockingPopup = ["card", "taxPopup", "cardFreeParking"].includes(actionType);
+  const isBlockingPopup = ["card", "taxPopup", "cardFreeParking", "roulette12Bonus", "tripleTwelveJail"].includes(actionType);
   const isActor = canIAct();
 
   els.cardActions.innerHTML = "";
   els.cardActions.classList.add("hidden");
   els.cardContinueBtn.classList.remove("hidden");
+
+  if (actionType === "roulette12Bonus") {
+    const streak = Number(roomState.pendingAction?.streak || 1);
+    els.cardActions.classList.remove("hidden");
+    els.cardActions.innerHTML = `
+      <button class="primary" type="button" onclick="acceptRoulette12Bonus(event)" ${isActor ? "" : "disabled"}>
+        Putar Lagi
+      </button>
+    `;
+    els.cardContinueBtn.classList.add("hidden");
+    return;
+  }
 
   if (actionType === "freeParkingChoice") {
     const pool = Number(roomState.taxPool || 0);
@@ -2661,8 +2853,13 @@ async function closeCardAndFinishTurn() {
     return;
   }
 
+  if (actionType === "roulette12Bonus") {
+    await acceptRoulette12Bonus();
+    return;
+  }
+
   if (!canIAct()) {
-    const blockingForMe = ["card", "taxPopup", "cardFreeParking"].includes(actionType)
+    const blockingForMe = ["card", "taxPopup", "cardFreeParking", "roulette12Bonus", "tripleTwelveJail"].includes(actionType)
       && Number(roomState?.pendingAction?.seat) === Number(mySeat);
 
     if (!blockingForMe) {
@@ -2676,7 +2873,7 @@ async function closeCardAndFinishTurn() {
     return;
   }
 
-  if (!["card", "taxPopup"].includes(actionType)) return;
+  if (!["card", "taxPopup", "tripleTwelveJail"].includes(actionType)) return;
 
   const actor = roomState.players[mySeat];
 
@@ -3552,7 +3749,12 @@ async function leaveRoom() {
   updates[`players/${mySeat}/inGame`] = false;
   updates[`players/${mySeat}/isHost`] = false;
   updates[`players/${mySeat}/disconnectedAt`] = firebase.database.ServerValue.TIMESTAMP;
+  updates[`players/${mySeat}/roulette12Streak`] = 0;
   updates[`presence/${mySeat}`] = null;
+
+  if (latest?.pendingExtraRoll && Number(latest.pendingExtraRoll.seat) === Number(mySeat)) {
+    updates.pendingExtraRoll = null;
+  }
 
   let newHostName = "";
 
@@ -3586,6 +3788,7 @@ async function leaveRoom() {
       updates.winnerSeat = winnerSeat;
       updates.isRolling = false;
       updates.pendingAction = null;
+      updates.pendingExtraRoll = null;
       updates.debtState = null;
       updates.currentSeat = winnerSeat;
       updates.cardPopup = {
@@ -3654,6 +3857,7 @@ els.createRoomBtn.addEventListener("click", createRoom);
 els.joinRoomBtn.addEventListener("click", joinRoom);
 els.startBtn.addEventListener("click", startGame);
 window.chooseFreeMoveTarget = chooseFreeMoveTarget;
+window.acceptRoulette12Bonus = acceptRoulette12Bonus;
 window.beginFreeMoveSelection = beginFreeMoveSelection;
 window.collectFreeParkingTax = collectFreeParkingTax;
 window.chooseSelectedFreeMoveTarget = chooseSelectedFreeMoveTarget;
