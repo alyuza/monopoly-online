@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Monopoly Board Game</title>
-  <link rel="stylesheet" href="./style.css?v=tablet-jail-rent-1" />
+  <link rel="stylesheet" href="./style.css?v=lobby-browser-v1" />
 </head>
 <body>
   <main id="appRoot" class="app">
@@ -24,30 +24,114 @@
       </div>
     </section>
 
-    <section id="setupPanel" class="setup-panel">
-      <div class="setup-card">
-        <h2>Masuk Game</h2>
-        <p>Isi nama, lalu buat room baru atau join room yang sudah ada.</p>
+    <section id="setupPanel" class="setup-panel lobby-setup">
+      <section id="profileSetupView" class="profile-entry-card">
+        <div class="profile-kicker">PROFIL PEMAIN</div>
+        <h2>Selamat datang</h2>
+        <p>Masukkan nama yang akan ditampilkan kepada pemain lain.</p>
+        <label for="playerNameInput">Nama Pemain</label>
+        <input id="playerNameInput" type="text" placeholder="Contoh: Roihan" maxlength="18" autocomplete="nickname" />
+        <button id="confirmProfileBtn" class="primary full" type="button">Konfirmasi</button>
+      </section>
 
-        <label>Nama Pemain</label>
-        <input id="playerNameInput" type="text" placeholder="Contoh: Pemain 1" maxlength="18" />
+      <section id="lobbyHomeView" class="lobby-home hidden" aria-live="polite">
+        <header class="lobby-profile-bar">
+          <div>
+            <div class="lobby-welcome">Welcome, <strong id="lobbyPlayerName">Pemain</strong></div>
+            <p>Pilih room yang tersedia atau buat room baru.</p>
+          </div>
+          <button id="editProfileBtn" class="primary lobby-edit-btn" type="button">Edit Profile</button>
+        </header>
 
-        <div class="setup-actions">
-          <button id="createRoomBtn" class="primary">Buat Room</button>
+        <section class="room-browser-card">
+          <div class="room-browser-header">
+            <div>
+              <div class="profile-kicker">ROOM BROWSER</div>
+              <h2>Room List</h2>
+            </div>
+            <button id="refreshRoomListBtn" class="ghost compact-btn" type="button" title="Perbarui daftar room">↻ Refresh</button>
+          </div>
+          <div id="roomListStatus" class="room-list-status">Memuat room...</div>
+          <div id="roomList" class="room-list" role="list"></div>
+        </section>
+
+        <div class="lobby-main-actions">
+          <button id="openCreateRoomBtn" class="primary" type="button">Create Room</button>
+          <button id="openJoinCodeBtn" class="gold" type="button">Masuk dengan Kode</button>
+        </div>
+        <p class="lobby-note">Public dan Private tampil di daftar. Unlisted hanya dapat ditemukan melalui kode room.</p>
+      </section>
+    </section>
+
+    <section id="editProfileOverlay" class="lobby-modal-overlay hidden" aria-hidden="true">
+      <div class="lobby-modal" role="dialog" aria-modal="true" aria-labelledby="editProfileTitle">
+        <button id="closeEditProfileBtn" class="lobby-modal-x" type="button" aria-label="Tutup">×</button>
+        <div class="profile-kicker">EDIT PROFILE</div>
+        <h2 id="editProfileTitle">Ganti Nama Pemain</h2>
+        <p>Perubahan nama digunakan saat membuat atau memasuki room berikutnya.</p>
+        <label for="editPlayerNameInput">Nama Pemain</label>
+        <input id="editPlayerNameInput" type="text" maxlength="18" autocomplete="nickname" />
+        <button id="saveProfileBtn" class="primary full" type="button">Simpan Nama</button>
+      </div>
+    </section>
+
+    <section id="createRoomOverlay" class="lobby-modal-overlay hidden" aria-hidden="true">
+      <div class="lobby-modal lobby-modal-wide" role="dialog" aria-modal="true" aria-labelledby="createRoomTitle">
+        <button id="closeCreateRoomBtn" class="lobby-modal-x" type="button" aria-label="Tutup">×</button>
+        <div class="profile-kicker">ROOM BARU</div>
+        <h2 id="createRoomTitle">Create Room</h2>
+
+        <label for="roomNameInput">Nama Room</label>
+        <input id="roomNameInput" type="text" placeholder="Contoh: Monopoly Malam Minggu" maxlength="30" />
+
+        <div class="field-label">Tipe Room</div>
+        <div class="visibility-options" role="radiogroup" aria-label="Tipe room">
+          <label class="visibility-option">
+            <input type="radio" name="roomVisibility" value="public" checked />
+            <span><b>🌐 Public</b><small>Tampil di Room List dan bebas dimasuki.</small></span>
+          </label>
+          <label class="visibility-option">
+            <input type="radio" name="roomVisibility" value="private" />
+            <span><b>🔒 Private</b><small>Tampil di Room List dan membutuhkan password.</small></span>
+          </label>
+          <label class="visibility-option">
+            <input type="radio" name="roomVisibility" value="unlisted" />
+            <span><b>🔗 Unlisted</b><small>Tidak tampil di daftar; masuk menggunakan kode.</small></span>
+          </label>
         </div>
 
-        <div class="divider">atau</div>
-
-        <label>Kode Room</label>
-        <input id="roomCodeInput" type="text" placeholder="Contoh: ATHO8K7M2Q9P" maxlength="12" />
-
-        <div class="setup-actions">
-          <button id="joinRoomBtn" class="gold">Join Room</button>
+        <div id="createRoomPasswordField" class="hidden">
+          <label for="createRoomPasswordInput"><span id="createPasswordLabel">Password Room</span></label>
+          <input id="createRoomPasswordInput" type="password" placeholder="Minimal 6 karakter" maxlength="40" autocomplete="new-password" />
+          <p id="createPasswordHint" class="field-hint">Password wajib untuk room Private.</p>
         </div>
 
-        <p class="small-note">
-          Room tersimpan di Firebase Realtime Database. Semua HP yang join room yang sama akan tersinkron otomatis.
-        </p>
+        <button id="createRoomBtn" class="primary full" type="button">Buat Room</button>
+      </div>
+    </section>
+
+    <section id="joinCodeOverlay" class="lobby-modal-overlay hidden" aria-hidden="true">
+      <div class="lobby-modal" role="dialog" aria-modal="true" aria-labelledby="joinCodeTitle">
+        <button id="closeJoinCodeBtn" class="lobby-modal-x" type="button" aria-label="Tutup">×</button>
+        <div class="profile-kicker">KODE ROOM</div>
+        <h2 id="joinCodeTitle">Masuk dengan Kode</h2>
+        <p>Gunakan kode untuk memasuki room Unlisted atau room lain yang kamu ketahui.</p>
+        <label for="roomCodeInput">Kode Room</label>
+        <input id="roomCodeInput" type="text" placeholder="Contoh: ATHO8K7M2Q9P" maxlength="12" autocomplete="off" />
+        <button id="joinRoomBtn" class="gold full" type="button">Cari & Masuk</button>
+      </div>
+    </section>
+
+    <section id="roomPasswordOverlay" class="lobby-modal-overlay hidden" aria-hidden="true">
+      <div class="lobby-modal" role="dialog" aria-modal="true" aria-labelledby="roomPasswordTitle">
+        <button id="closeRoomPasswordBtn" class="lobby-modal-x" type="button" aria-label="Tutup">×</button>
+        <div class="profile-kicker">ROOM TERKUNCI</div>
+        <h2 id="roomPasswordTitle">Masukkan Password</h2>
+        <p id="roomPasswordDescription">Room ini membutuhkan password.</p>
+        <label for="roomPasswordInput">Password Room</label>
+        <input id="roomPasswordInput" type="password" maxlength="40" autocomplete="current-password" />
+        <div id="roomPasswordError" class="form-error hidden"></div>
+        <button id="confirmRoomPasswordBtn" class="primary full" type="button">Buka Room</button>
       </div>
     </section>
 
@@ -178,6 +262,6 @@
   <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
 
   <script src="./firebase-config.js"></script>
-  <script src="./game.js?v=asset-exit-jail-v2"></script>
+  <script src="./game.js?v=order-roll-finalizer-v2"></script>
 </body>
 </html>

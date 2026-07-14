@@ -18,6 +18,11 @@ const DIRECT_PAWN_MOVE_MS = 760;
 const DISCONNECT_GRACE_MS = 30000;
 const PLAYER_PAYMENT_TOAST_MS = 5000;
 
+// Lobby dan directory room. Engine permainan tidak bergantung pada konstanta ini.
+const PLAYER_PROFILE_KEY = "atho_player_profile_name";
+const ROOM_DIRECTORY_HEARTBEAT_MS = 15000;
+const ROOM_VISIBILITIES = new Set(["public", "private", "unlisted"]);
+
 const PROPERTY_DATA = {
   "kuala-lumpur": { name: "Kuala Lumpur", kind: "city", group: "dark-bottom", color: "#28104d", mortgage: 30, rents: [5,20,60,180,320,450], buildingCost: 50 },
   "bangkok": { name: "Bangkok", kind: "city", group: "dark-bottom", color: "#28104d", mortgage: 30, rents: [5,20,60,180,320,450], buildingCost: 50 },
@@ -286,6 +291,18 @@ let playerPaymentToastId = "";
 let rouletteSoundTimers = [];
 let rouletteSoundId = "";
 
+// State lokal lobby. Dipisahkan dari roomState agar tidak mengubah engine permainan.
+let savedPlayerName = "";
+let roomDirectoryRef = null;
+let roomDirectoryHandler = null;
+let latestRoomDirectory = {};
+let roomDirectorySyncTimer = null;
+let lastRoomDirectorySignature = "";
+let lastRoomDirectorySyncAt = 0;
+let pendingJoinContext = null;
+let lobbyActionInProgress = false;
+let roomEmptySinceRef = null;
+
 // Voice chat WebRTC: Firebase hanya dipakai sebagai signaling.
 const VOICE_SIGNAL_MAX_AGE_MS = 60_000;
 const DEFAULT_VOICE_ICE_SERVERS = [
@@ -315,7 +332,37 @@ const els = {
   setupPanel: document.getElementById("setupPanel"),
   gamePanel: document.getElementById("gamePanel"),
   playerNameInput: document.getElementById("playerNameInput"),
+  profileSetupView: document.getElementById("profileSetupView"),
+  lobbyHomeView: document.getElementById("lobbyHomeView"),
+  lobbyPlayerName: document.getElementById("lobbyPlayerName"),
+  confirmProfileBtn: document.getElementById("confirmProfileBtn"),
+  editProfileBtn: document.getElementById("editProfileBtn"),
+  editProfileOverlay: document.getElementById("editProfileOverlay"),
+  editPlayerNameInput: document.getElementById("editPlayerNameInput"),
+  saveProfileBtn: document.getElementById("saveProfileBtn"),
+  closeEditProfileBtn: document.getElementById("closeEditProfileBtn"),
+  roomList: document.getElementById("roomList"),
+  roomListStatus: document.getElementById("roomListStatus"),
+  refreshRoomListBtn: document.getElementById("refreshRoomListBtn"),
+  openCreateRoomBtn: document.getElementById("openCreateRoomBtn"),
+  createRoomOverlay: document.getElementById("createRoomOverlay"),
+  closeCreateRoomBtn: document.getElementById("closeCreateRoomBtn"),
+  roomNameInput: document.getElementById("roomNameInput"),
+  createRoomPasswordField: document.getElementById("createRoomPasswordField"),
+  createRoomPasswordInput: document.getElementById("createRoomPasswordInput"),
+  createPasswordLabel: document.getElementById("createPasswordLabel"),
+  createPasswordHint: document.getElementById("createPasswordHint"),
+  openJoinCodeBtn: document.getElementById("openJoinCodeBtn"),
+  joinCodeOverlay: document.getElementById("joinCodeOverlay"),
+  closeJoinCodeBtn: document.getElementById("closeJoinCodeBtn"),
   roomCodeInput: document.getElementById("roomCodeInput"),
+  roomPasswordOverlay: document.getElementById("roomPasswordOverlay"),
+  roomPasswordTitle: document.getElementById("roomPasswordTitle"),
+  roomPasswordDescription: document.getElementById("roomPasswordDescription"),
+  roomPasswordInput: document.getElementById("roomPasswordInput"),
+  roomPasswordError: document.getElementById("roomPasswordError"),
+  confirmRoomPasswordBtn: document.getElementById("confirmRoomPasswordBtn"),
+  closeRoomPasswordBtn: document.getElementById("closeRoomPasswordBtn"),
   createRoomBtn: document.getElementById("createRoomBtn"),
   joinRoomBtn: document.getElementById("joinRoomBtn"),
   copyRoomBtn: document.getElementById("copyRoomBtn"),
@@ -443,6 +490,505 @@ function clearRoomSession() {
   localStorage.removeItem(ROOM_SESSION_KEY);
 }
 
+
+function cleanRoomName(value) {
+  const roomName = String(value || "")
+    .replace(/[\u0000-\u001F\u007F]/g, "")
+    .trim()
+    .replace(/\s+/g, " ");
+  return roomName.slice(0, 30);
+}
+
+function normalizeRoomCode(value) {
+  return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12);
+}
+
+function normalizeVisibility(value) {
+  const visibility = String(value || "public").toLowerCase();
+  return ROOM_VISIBILITIES.has(visibility) ? visibility : "public";
+}
+
+function readSavedPlayerName() {
+  return cleanName(localStorage.getItem(PLAYER_PROFILE_KEY) || "");
+}
+
+function persistPlayerName(value) {
+  const playerName = cleanName(value).slice(0, 18);
+  localStorage.setItem(PLAYER_PROFILE_KEY, playerName);
+  savedPlayerName = playerName;
+  if (els.lobbyPlayerName) els.lobbyPlayerName.textContent = playerName;
+  if (els.playerNameInput) els.playerNameInput.value = playerName;
+  if (els.editPlayerNameInput) els.editPlayerNameInput.value = playerName;
+  return playerName;
+}
+
+function getActiveProfileName() {
+  if (!savedPlayerName) savedPlayerName = readSavedPlayerName();
+  return cleanName(savedPlayerName || "Pemain").slice(0, 18);
+}
+
+function setOverlayVisible(element, visible) {
+  if (!element) return;
+  element.classList.toggle("hidden", !visible);
+  element.setAttribute("aria-hidden", visible ? "false" : "true");
+}
+
+function closeAllLobbyModals() {
+  setOverlayVisible(els.editProfileOverlay, false);
+  setOverlayVisible(els.createRoomOverlay, false);
+  setOverlayVisible(els.joinCodeOverlay, false);
+  setOverlayVisible(els.roomPasswordOverlay, false);
+  pendingJoinContext = null;
+  if (els.roomPasswordError) {
+    els.roomPasswordError.textContent = "";
+    els.roomPasswordError.classList.add("hidden");
+  }
+}
+
+function showProfileSetup() {
+  stopRoomDirectorySubscription();
+  closeAllLobbyModals();
+  els.profileSetupView?.classList.remove("hidden");
+  els.lobbyHomeView?.classList.add("hidden");
+  requestAnimationFrame(() => els.playerNameInput?.focus());
+}
+
+function showLobbyHome() {
+  const profileName = getActiveProfileName();
+  if (!profileName || profileName === "Pemain" && !localStorage.getItem(PLAYER_PROFILE_KEY)) {
+    showProfileSetup();
+    return;
+  }
+
+  closeAllLobbyModals();
+  els.profileSetupView?.classList.add("hidden");
+  els.lobbyHomeView?.classList.remove("hidden");
+  if (els.lobbyPlayerName) els.lobbyPlayerName.textContent = profileName;
+  startRoomDirectorySubscription();
+}
+
+function initializeLobbyFlow() {
+  const stored = String(localStorage.getItem(PLAYER_PROFILE_KEY) || "").trim();
+  if (stored) {
+    persistPlayerName(stored);
+    showLobbyHome();
+  } else {
+    savedPlayerName = "";
+    if (els.playerNameInput) els.playerNameInput.value = "";
+    showProfileSetup();
+  }
+}
+
+function confirmPlayerProfile() {
+  const raw = String(els.playerNameInput?.value || "").trim();
+  if (!raw) {
+    alert("Masukkan nama pemain terlebih dahulu.");
+    els.playerNameInput?.focus();
+    return;
+  }
+  persistPlayerName(raw);
+  showLobbyHome();
+}
+
+function openEditProfile() {
+  if (els.editPlayerNameInput) els.editPlayerNameInput.value = getActiveProfileName();
+  setOverlayVisible(els.editProfileOverlay, true);
+  requestAnimationFrame(() => {
+    els.editPlayerNameInput?.focus();
+    els.editPlayerNameInput?.select();
+  });
+}
+
+function saveEditedProfile() {
+  const raw = String(els.editPlayerNameInput?.value || "").trim();
+  if (!raw) {
+    alert("Nama pemain tidak boleh kosong.");
+    return;
+  }
+  persistPlayerName(raw);
+  setOverlayVisible(els.editProfileOverlay, false);
+}
+
+function getSelectedRoomVisibility() {
+  const checked = document.querySelector('input[name="roomVisibility"]:checked');
+  return normalizeVisibility(checked?.value || "public");
+}
+
+function updateCreateRoomPasswordField() {
+  const visibility = getSelectedRoomVisibility();
+  const requiresField = visibility !== "public";
+  els.createRoomPasswordField?.classList.toggle("hidden", !requiresField);
+  if (els.createPasswordLabel) {
+    els.createPasswordLabel.textContent = visibility === "private"
+      ? "Password Room"
+      : "Password Room (Opsional)";
+  }
+  if (els.createPasswordHint) {
+    els.createPasswordHint.textContent = visibility === "private"
+      ? "Password wajib dan minimal 6 karakter untuk room Private."
+      : "Kosongkan jika room Unlisted tidak memerlukan password.";
+  }
+  if (!requiresField && els.createRoomPasswordInput) {
+    els.createRoomPasswordInput.value = "";
+  }
+}
+
+function openCreateRoomModal() {
+  if (els.roomNameInput) els.roomNameInput.value = `${getActiveProfileName()}'s Room`.slice(0, 30);
+  const publicOption = document.querySelector('input[name="roomVisibility"][value="public"]');
+  if (publicOption) publicOption.checked = true;
+  if (els.createRoomPasswordInput) els.createRoomPasswordInput.value = "";
+  updateCreateRoomPasswordField();
+  setOverlayVisible(els.createRoomOverlay, true);
+  requestAnimationFrame(() => {
+    els.roomNameInput?.focus();
+    els.roomNameInput?.select();
+  });
+}
+
+function openJoinCodeModal() {
+  if (els.roomCodeInput) els.roomCodeInput.value = "";
+  setOverlayVisible(els.joinCodeOverlay, true);
+  requestAnimationFrame(() => els.roomCodeInput?.focus());
+}
+
+function roomStatusLabel(status, isFull = false) {
+  if (isFull) return "Room Penuh";
+  const labels = {
+    lobby: "Menunggu Pemain",
+    orderRoll: "Menentukan Urutan",
+    playing: "Sedang Bermain",
+    finished: "Permainan Selesai"
+  };
+  return labels[status] || "Status Tidak Diketahui";
+}
+
+function normalizeDirectoryEntry(code, value) {
+  const entry = value && typeof value === "object" ? value : {};
+  const visibility = normalizeVisibility(entry.visibility);
+  return {
+    roomCode: normalizeRoomCode(entry.roomCode || code),
+    roomName: cleanRoomName(entry.roomName || `Room ${code}`),
+    visibility,
+    requiresPassword: entry.requiresPassword === true,
+    status: String(entry.status || "lobby"),
+    playerCount: Math.max(0, Math.min(MAX_GAME_PLAYERS, Number(entry.playerCount || 0))),
+    spectatorCount: Math.max(0, Math.min(MAX_ROOM_MEMBERS - MAX_GAME_PLAYERS, Number(entry.spectatorCount || 0))),
+    maxPlayers: MAX_GAME_PLAYERS,
+    maxSpectators: MAX_ROOM_MEMBERS - MAX_GAME_PLAYERS,
+    createdAt: Number(entry.createdAt || 0),
+    lastActivityAt: Number(entry.lastActivityAt || entry.createdAt || 0),
+    emptySince: Number(entry.emptySince || 0) || null
+  };
+}
+
+function sortRoomDirectoryEntries(entries) {
+  return [...entries].sort((a, b) => {
+    if (b.playerCount !== a.playerCount) return b.playerCount - a.playerCount;
+    const aLobby = a.status === "lobby" ? 1 : 0;
+    const bLobby = b.status === "lobby" ? 1 : 0;
+    if (bLobby !== aLobby) return bLobby - aLobby;
+    if (b.spectatorCount !== a.spectatorCount) return b.spectatorCount - a.spectatorCount;
+    return b.lastActivityAt - a.lastActivityAt;
+  });
+}
+
+function renderRoomDirectory() {
+  if (!els.roomList || !els.roomListStatus) return;
+  const entries = sortRoomDirectoryEntries(
+    Object.entries(latestRoomDirectory || {})
+      .map(([code, value]) => normalizeDirectoryEntry(code, value))
+      .filter(entry => entry.visibility === "public" || entry.visibility === "private")
+      .filter(entry => entry.status !== "finished")
+  );
+
+  els.roomListStatus.textContent = entries.length
+    ? `${entries.length} room aktif ditemukan.`
+    : "Belum ada room yang dapat ditampilkan.";
+
+  if (!entries.length) {
+    els.roomList.innerHTML = `
+      <div class="room-empty-state">
+        <div><strong>Belum ada room aktif</strong>Buat room baru atau masuk menggunakan kode.</div>
+      </div>`;
+    return;
+  }
+
+  els.roomList.innerHTML = entries.map(entry => {
+    const gameStarted = entry.status !== "lobby";
+    const roomIsFull = gameStarted
+      ? entry.spectatorCount >= entry.maxSpectators
+      : entry.playerCount >= entry.maxPlayers && entry.spectatorCount >= entry.maxSpectators;
+    const playerSeatAvailable = entry.status === "lobby" && entry.playerCount < entry.maxPlayers;
+    const buttonLabel = roomIsFull ? "Room Penuh" : (playerSeatAvailable ? "Masuk" : "Tonton");
+    const icon = entry.visibility === "private" ? "🔒" : "🌐";
+    const statusClass = roomIsFull ? "full" : escapeHTML(entry.status);
+    return `
+      <article class="room-card ${escapeHTML(entry.visibility)}" role="listitem">
+        <div class="room-card-main">
+          <div class="room-card-title-row">
+            <span class="room-type-icon" aria-hidden="true">${icon}</span>
+            <div class="room-card-title" title="${escapeHTML(entry.roomName)}">${escapeHTML(entry.roomName)}</div>
+          </div>
+          <span class="room-status-pill ${statusClass}">${escapeHTML(roomStatusLabel(entry.status, roomIsFull))}</span>
+          <div class="room-card-meta">
+            <span>👤 ${entry.playerCount}/${entry.maxPlayers} pemain</span>
+            <span>👁 ${entry.spectatorCount}/${entry.maxSpectators} penonton</span>
+            <span>${entry.visibility === "private" ? "Private" : "Public"}</span>
+          </div>
+          <div class="room-card-code">${escapeHTML(entry.roomCode)}</div>
+        </div>
+        <button class="${entry.visibility === "private" ? "gold" : "primary"} room-join-btn" type="button"
+          data-room-code="${escapeHTML(entry.roomCode)}" ${roomIsFull ? "disabled" : ""}>${buttonLabel}</button>
+      </article>`;
+  }).join("");
+}
+
+function startRoomDirectorySubscription() {
+  if (!db || roomDirectoryHandler || els.lobbyHomeView?.classList.contains("hidden")) return;
+  roomDirectoryRef = db.ref("roomDirectory");
+  els.roomListStatus.textContent = "Memuat room...";
+  els.roomList.innerHTML = '<div class="room-loading-skeleton">Mengambil daftar room...</div>';
+  roomDirectoryHandler = snapshot => {
+    latestRoomDirectory = snapshot.val() || {};
+    renderRoomDirectory();
+  };
+  roomDirectoryRef.on("value", roomDirectoryHandler, error => {
+    console.warn("Daftar room tidak dapat dibaca.", error);
+    els.roomListStatus.textContent = "Daftar room gagal dimuat.";
+    els.roomList.innerHTML = '<div class="room-empty-state"><div><strong>Gagal memuat room</strong>Periksa koneksi dan Firebase Rules.</div></div>';
+  });
+}
+
+function stopRoomDirectorySubscription() {
+  if (roomDirectoryRef && roomDirectoryHandler) {
+    roomDirectoryRef.off("value", roomDirectoryHandler);
+  }
+  roomDirectoryRef = null;
+  roomDirectoryHandler = null;
+}
+
+async function refreshRoomDirectory() {
+  if (!db) return;
+  els.refreshRoomListBtn.disabled = true;
+  try {
+    const snapshot = await db.ref("roomDirectory").once("value");
+    latestRoomDirectory = snapshot.val() || {};
+    renderRoomDirectory();
+  } finally {
+    els.refreshRoomListBtn.disabled = false;
+  }
+}
+
+function randomHex(bytes = 16) {
+  const data = new Uint8Array(bytes);
+  crypto.getRandomValues(data);
+  return Array.from(data, value => value.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(value) {
+  if (!crypto?.subtle) throw new Error("Browser tidak mendukung Web Crypto.");
+  const encoded = new TextEncoder().encode(String(value));
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function makePasswordProof(password, salt) {
+  return sha256Hex(`${String(salt || "")}:${String(password || "")}`);
+}
+
+function buildRoomListing(stateLike, code = roomCode) {
+  const players = Object.values(stateLike?.players || {});
+  const playerCount = players.filter(player => player?.id && isMonopolyPlayer(player) && isPlayerConnectedInState(stateLike, player)).length;
+  const spectatorCount = players.filter(player => player?.id && isSpectator(player) && isPlayerConnectedInState(stateLike, player)).length;
+  const visibility = normalizeVisibility(stateLike?.visibility || "public");
+  return {
+    roomCode: normalizeRoomCode(code),
+    roomName: cleanRoomName(stateLike?.roomName || `Room ${code}`),
+    visibility,
+    requiresPassword: stateLike?.requiresPassword === true,
+    status: String(stateLike?.status || "lobby"),
+    playerCount,
+    spectatorCount,
+    maxPlayers: MAX_GAME_PLAYERS,
+    maxSpectators: MAX_ROOM_MEMBERS - MAX_GAME_PLAYERS,
+    createdAt: Number(stateLike?.createdAt || Date.now()),
+    lastActivityAt: firebase.database.ServerValue.TIMESTAMP,
+    emptySince: stateLike?.emptySince || null
+  };
+}
+
+async function syncRoomListingNow(stateLike = roomState, { force = false } = {}) {
+  if (!db || !roomRef || !roomCode || !stateLike || mySeat === null) return;
+  const listing = buildRoomListing(stateLike, roomCode);
+  const signature = JSON.stringify({
+    roomName: listing.roomName,
+    visibility: listing.visibility,
+    requiresPassword: listing.requiresPassword,
+    status: listing.status,
+    playerCount: listing.playerCount,
+    spectatorCount: listing.spectatorCount,
+    emptySince: listing.emptySince || null
+  });
+  const now = Date.now();
+  if (!force && signature === lastRoomDirectorySignature && now - lastRoomDirectorySyncAt < ROOM_DIRECTORY_HEARTBEAT_MS) return;
+
+  lastRoomDirectorySignature = signature;
+  lastRoomDirectorySyncAt = now;
+
+  const updates = {};
+  Object.entries(listing).forEach(([key, value]) => {
+    updates[`roomLookup/${roomCode}/${key}`] = value;
+  });
+  if (listing.visibility === "unlisted") {
+    updates[`roomDirectory/${roomCode}`] = null;
+  } else {
+    updates[`roomDirectory/${roomCode}`] = listing;
+  }
+  await db.ref().update(updates);
+}
+
+function scheduleRoomListingSync(stateLike = roomState, { force = false } = {}) {
+  if (roomDirectorySyncTimer) clearTimeout(roomDirectorySyncTimer);
+  roomDirectorySyncTimer = setTimeout(() => {
+    roomDirectorySyncTimer = null;
+    syncRoomListingNow(stateLike, { force }).catch(error => {
+      console.warn("Metadata Room List gagal diperbarui.", error);
+    });
+  }, force ? 0 : 120);
+}
+
+async function readRoomLookup(code) {
+  const normalizedCode = normalizeRoomCode(code);
+  if (!normalizedCode) return null;
+  const snapshot = await db.ref(`roomLookup/${normalizedCode}`).once("value");
+  if (snapshot.exists()) return normalizeDirectoryEntry(normalizedCode, snapshot.val());
+
+  // Backward compatibility untuk room lama yang belum mempunyai roomLookup.
+  try {
+    const roomSnapshot = await db.ref(`rooms/${normalizedCode}`).once("value");
+    if (!roomSnapshot.exists()) return null;
+    const state = roomSnapshot.val();
+    return normalizeDirectoryEntry(normalizedCode, {
+      roomCode: normalizedCode,
+      roomName: state.roomName || `Room ${normalizedCode}`,
+      visibility: state.visibility || "public",
+      requiresPassword: state.requiresPassword === true,
+      status: state.status || "lobby",
+      playerCount: Object.values(state.players || {}).filter(player => player?.id && !isSpectator(player)).length,
+      spectatorCount: Object.values(state.players || {}).filter(player => player?.id && isSpectator(player)).length,
+      createdAt: state.createdAt || 0,
+      lastActivityAt: state.lastActivityAt || state.createdAt || 0
+    });
+  } catch (error) {
+    if (String(error?.code || "").toUpperCase().includes("PERMISSION_DENIED")) return null;
+    throw error;
+  }
+}
+
+async function hasStoredRoomAccess(code) {
+  if (!db || !currentAuthUid) return false;
+  const snapshot = await db.ref(`roomAccess/${normalizeRoomCode(code)}/${currentAuthUid}/granted`).once("value");
+  return snapshot.val() === true;
+}
+
+function openRoomPasswordPrompt(context) {
+  pendingJoinContext = context;
+  if (els.roomPasswordTitle) els.roomPasswordTitle.textContent = `Buka ${context.lookup.roomName}`;
+  if (els.roomPasswordDescription) {
+    els.roomPasswordDescription.textContent = `${context.lookup.visibility === "private" ? "Room Private" : "Room Unlisted"} ini membutuhkan password.`;
+  }
+  if (els.roomPasswordInput) els.roomPasswordInput.value = "";
+  if (els.roomPasswordError) {
+    els.roomPasswordError.textContent = "";
+    els.roomPasswordError.classList.add("hidden");
+  }
+  setOverlayVisible(els.roomPasswordOverlay, true);
+  requestAnimationFrame(() => els.roomPasswordInput?.focus());
+}
+
+async function grantRoomAccess(code, lookup, password) {
+  const salt = String(lookup?.passwordSalt || "");
+  if (!salt) {
+    // Salt berada pada roomLookup; baca data mentah karena normalizer tidak menyimpannya.
+    const rawLookupSnapshot = await db.ref(`roomLookup/${normalizeRoomCode(code)}`).once("value");
+    const rawLookup = rawLookupSnapshot.val() || {};
+    lookup.passwordSalt = String(rawLookup.passwordSalt || "");
+  }
+  if (!lookup.passwordSalt) throw new Error("Konfigurasi password room tidak lengkap.");
+  const proof = await makePasswordProof(password, lookup.passwordSalt);
+  await db.ref(`roomAccess/${normalizeRoomCode(code)}/${currentAuthUid}`).set({
+    granted: true,
+    proof,
+    grantedAt: firebase.database.ServerValue.TIMESTAMP
+  });
+}
+
+async function requestJoinRoom(code, suppliedLookup = null) {
+  if (lobbyActionInProgress) return;
+  const normalizedCode = normalizeRoomCode(code);
+  if (!normalizedCode) {
+    alert("Masukkan kode room terlebih dahulu.");
+    return;
+  }
+
+  lobbyActionInProgress = true;
+  try {
+    const lookup = suppliedLookup || await readRoomLookup(normalizedCode);
+    if (!lookup) {
+      alert("Room tidak ditemukan atau sudah tidak aktif.");
+      return;
+    }
+
+    const roomIsFull = lookup.status !== "lobby"
+      ? lookup.spectatorCount >= MAX_ROOM_MEMBERS - MAX_GAME_PLAYERS
+      : lookup.playerCount >= MAX_GAME_PLAYERS
+        && lookup.spectatorCount >= MAX_ROOM_MEMBERS - MAX_GAME_PLAYERS;
+    if (roomIsFull) {
+      alert("Room sudah penuh.");
+      return;
+    }
+
+    const needsPassword = lookup.requiresPassword === true;
+    if (needsPassword && !(await hasStoredRoomAccess(normalizedCode))) {
+      openRoomPasswordPrompt({ code: normalizedCode, lookup });
+      return;
+    }
+
+    closeAllLobbyModals();
+    await joinRoomByCode(normalizedCode);
+  } finally {
+    lobbyActionInProgress = false;
+  }
+}
+
+async function confirmRoomPassword() {
+  if (!pendingJoinContext || lobbyActionInProgress) return;
+  const password = String(els.roomPasswordInput?.value || "");
+  if (!password) {
+    els.roomPasswordError.textContent = "Masukkan password room.";
+    els.roomPasswordError.classList.remove("hidden");
+    return;
+  }
+
+  lobbyActionInProgress = true;
+  els.confirmRoomPasswordBtn.disabled = true;
+  try {
+    await grantRoomAccess(pendingJoinContext.code, pendingJoinContext.lookup, password);
+    const code = pendingJoinContext.code;
+    closeAllLobbyModals();
+    await joinRoomByCode(code);
+  } catch (error) {
+    console.warn("Password room ditolak.", error);
+    els.roomPasswordError.textContent = "Password salah atau akses room telah kedaluwarsa.";
+    els.roomPasswordError.classList.remove("hidden");
+    els.roomPasswordInput?.select();
+  } finally {
+    lobbyActionInProgress = false;
+    els.confirmRoomPasswordBtn.disabled = false;
+  }
+}
+
 async function returnToSetupView(message = "") {
   if (membershipResetInProgress) return;
   membershipResetInProgress = true;
@@ -466,6 +1012,10 @@ async function returnToSetupView(message = "") {
   roomState = null;
   roomCode = "";
   mySeat = null;
+  lastRoomDirectorySignature = "";
+  lastRoomDirectorySyncAt = 0;
+  if (roomDirectorySyncTimer) clearTimeout(roomDirectorySyncTimer);
+  roomDirectorySyncTimer = null;
   clearRoomSession();
 
   els.appRoot?.classList.remove("game-active");
@@ -475,6 +1025,7 @@ async function returnToSetupView(message = "") {
   els.copyRoomBtn.disabled = true;
   els.leaveBtn.disabled = true;
   els.disconnectOverlay?.classList.add("hidden");
+  showLobbyHome();
 
   membershipResetInProgress = false;
   if (message) setTimeout(() => alert(message), 80);
@@ -841,6 +1392,9 @@ async function configureCurrentPresence() {
     connected: false,
     disconnectedAt: serverTimestamp
   });
+  // emptySince hanya ditandai oleh leave terakhir atau cleanup server setelah
+  // memastikan seluruh presence benar-benar kosong. Jangan menandainya dari
+  // onDisconnect satu client karena anggota lain mungkin masih berada di room.
 
   await playerPresenceRef.set({
     playerId: myPlayerId,
@@ -853,6 +1407,9 @@ async function configureCurrentPresence() {
     disconnectedAt: null,
     lastSeenAt: serverTimestamp
   });
+  if (roomEmptySinceRef) {
+    await roomEmptySinceRef.set(null);
+  }
 }
 
 async function detachCurrentPresence({ cancelDisconnect = true } = {}) {
@@ -864,6 +1421,7 @@ async function detachCurrentPresence({ cancelDisconnect = true } = {}) {
     try {
       await playerPresenceRef?.onDisconnect().cancel();
       await presencePlayerRef?.onDisconnect().cancel();
+      await roomEmptySinceRef?.onDisconnect().cancel();
     } catch (error) {
       console.warn("Gagal membatalkan handler onDisconnect.", error);
     }
@@ -876,6 +1434,7 @@ async function detachCurrentPresence({ cancelDisconnect = true } = {}) {
   connectionInfoHandler = null;
   playerPresenceRef = null;
   presencePlayerRef = null;
+  roomEmptySinceRef = null;
   presenceConnectionId = "";
 }
 
@@ -886,6 +1445,7 @@ async function setupCurrentPresence() {
   presenceConnectionId = `conn_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   playerPresenceRef = roomRef.child(`presence/${mySeat}/${presenceConnectionId}`);
   presencePlayerRef = roomRef.child(`players/${mySeat}`);
+  roomEmptySinceRef = roomRef.child("emptySince");
   connectionInfoRef = db.ref(".info/connected");
 
   connectionInfoHandler = (snapshot) => {
@@ -952,6 +1512,7 @@ async function restoreRoomSession() {
     roomCode = storedRoomCode;
     roomRef = candidateRoomRef;
     mySeat = Number(matchingPlayer.seat);
+    persistPlayerName(matchingPlayer.name || session.playerName || "Pemain");
 
     await setupCurrentPresence();
     saveRoomSession(matchingPlayer.name || session.playerName || "Pemain");
@@ -1018,7 +1579,7 @@ function makeInitialPropertyState() {
   return data;
 }
 
-function createInitialRoom(hostName) {
+function createInitialRoom(hostName, roomOptions = {}) {
   const players = {};
   for (let i = 0; i < MAX_ROOM_MEMBERS; i++) {
     players[i] = {
@@ -1044,9 +1605,18 @@ function createInitialRoom(hostName) {
     };
   }
 
+  const roomName = cleanRoomName(roomOptions.roomName || `${hostName}'s Room`) || "Monopoly Room";
+  const visibility = normalizeVisibility(roomOptions.visibility || "public");
+
   return {
+    schemaVersion: 2,
+    roomName,
+    visibility,
+    requiresPassword: roomOptions.requiresPassword === true,
     status: "lobby",
     createdAt: Date.now(),
+    lastActivityAt: Date.now(),
+    emptySince: null,
     hostSeat: 0,
     currentSeat: 0,
     isRolling: false,
@@ -1071,96 +1641,256 @@ function createInitialRoom(hostName) {
   };
 }
 
-async function createRoom() {
-  await firebaseReadyPromise;
-  const playerName = cleanName(els.playerNameInput.value);
-  myPlayerId = makePlayerId();
-  roomCode = randomRoomCode();
-  roomRef = db.ref(`rooms/${roomCode}`);
-
-  await roomRef.set(createInitialRoom(playerName));
-  mySeat = 0;
-  await setupCurrentPresence();
-  saveRoomSession(playerName);
-  enterGameView();
-  subscribeRoom();
+async function reserveRoomSecret(roomOptions) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidateCode = randomRoomCode();
+    const secretRef = db.ref(`roomSecrets/${candidateCode}`);
+    try {
+      await secretRef.set({
+        ownerUid: currentAuthUid,
+        visibility: roomOptions.visibility,
+        requiresPassword: roomOptions.requiresPassword,
+        passwordHash: roomOptions.passwordHash || "",
+        createdAt: firebase.database.ServerValue.TIMESTAMP
+      });
+      return candidateCode;
+    } catch (error) {
+      const permissionDenied = String(error?.code || "").toUpperCase().includes("PERMISSION_DENIED");
+      if (!permissionDenied || attempt === 7) throw error;
+    }
+  }
+  throw new Error("Gagal membuat kode room unik.");
 }
 
-async function joinRoom() {
+async function createRoom() {
+  if (lobbyActionInProgress) return;
   await firebaseReadyPromise;
-  const playerName = cleanName(els.playerNameInput.value);
-  const code = String(els.roomCodeInput.value || "").trim().toUpperCase();
 
-  if (!code) {
+  const playerName = getActiveProfileName();
+  const roomName = cleanRoomName(els.roomNameInput?.value);
+  const visibility = getSelectedRoomVisibility();
+  const password = String(els.createRoomPasswordInput?.value || "");
+
+  if (roomName.length < 3) {
+    alert("Nama room minimal 3 karakter.");
+    els.roomNameInput?.focus();
+    return;
+  }
+
+  if (visibility === "private" && password.length < 6) {
+    alert("Room Private harus memakai password minimal 6 karakter.");
+    els.createRoomPasswordInput?.focus();
+    return;
+  }
+
+  if (visibility === "unlisted" && password.length > 0 && password.length < 6) {
+    alert("Password room minimal 6 karakter, atau kosongkan jika tidak ingin memakai password.");
+    els.createRoomPasswordInput?.focus();
+    return;
+  }
+
+  const requiresPassword = visibility === "private" || (visibility === "unlisted" && password.length > 0);
+
+  lobbyActionInProgress = true;
+  els.createRoomBtn.disabled = true;
+  let reservedCode = "";
+
+  try {
+    const passwordSalt = requiresPassword ? randomHex(16) : "";
+    const passwordHash = requiresPassword ? await makePasswordProof(password, passwordSalt) : "";
+    myPlayerId = makePlayerId();
+    reservedCode = await reserveRoomSecret({ visibility, requiresPassword, passwordHash });
+    roomCode = reservedCode;
+    roomRef = db.ref(`rooms/${roomCode}`);
+
+    const initialRoom = createInitialRoom(playerName, { roomName, visibility, requiresPassword });
+    const listing = buildRoomListing(initialRoom, roomCode);
+    const lookup = {
+      ...listing,
+      lastActivityAt: firebase.database.ServerValue.TIMESTAMP,
+      passwordSalt: requiresPassword ? passwordSalt : ""
+    };
+    const createUpdates = {
+      [`rooms/${roomCode}`]: initialRoom,
+      [`roomLookup/${roomCode}`]: lookup
+    };
+    if (visibility !== "unlisted") {
+      createUpdates[`roomDirectory/${roomCode}`] = listing;
+    }
+    // Room dan metadata browser dibuat dalam satu multi-location update agar
+    // tidak ada room setengah jadi di antara dua request.
+    await db.ref().update(createUpdates);
+
+    mySeat = 0;
+    await setupCurrentPresence();
+    saveRoomSession(playerName);
+    closeAllLobbyModals();
+    enterGameView();
+    subscribeRoom();
+
+    if (visibility === "unlisted") {
+      setTimeout(() => alert(`Room Unlisted berhasil dibuat. Bagikan kode ini kepada temanmu: ${roomCode}`), 120);
+    }
+  } catch (error) {
+    if (roomRef && reservedCode) {
+      try { await roomRef.remove(); } catch (_) {}
+    }
+    if (reservedCode) {
+      try { await db.ref(`roomDirectory/${reservedCode}`).remove(); } catch (_) {}
+      try { await db.ref(`roomLookup/${reservedCode}`).remove(); } catch (_) {}
+      try { await db.ref(`roomSecrets/${reservedCode}`).remove(); } catch (_) {}
+    }
+    roomRef = null;
+    roomCode = "";
+    mySeat = null;
+    throw error;
+  } finally {
+    lobbyActionInProgress = false;
+    els.createRoomBtn.disabled = false;
+  }
+}
+
+async function claimRoomSeatAtomically(seat, playerName, { allowEmpty = true } = {}) {
+  const normalizedSeat = Number(seat);
+  if (!roomRef || !Number.isInteger(normalizedSeat) || normalizedSeat < 0 || normalizedSeat >= MAX_ROOM_MEMBERS) {
+    return null;
+  }
+
+  const role = normalizedSeat < MAX_GAME_PLAYERS ? "player" : "spectator";
+  let claimMode = "";
+
+  const result = await roomRef.child(`players/${normalizedSeat}`).transaction((currentPlayer) => {
+    const current = currentPlayer && typeof currentPlayer === "object" ? currentPlayer : {};
+    const sameMembership = current.id === myPlayerId && current.authUid === currentAuthUid;
+    const seatIsEmpty = !String(current.id || "") && !String(current.authUid || "");
+
+    if (!sameMembership && !(allowEmpty && seatIsEmpty)) return;
+
+    claimMode = sameMembership ? "reconnect" : "new";
+
+    const nextPlayer = {
+      ...current,
+      seat: normalizedSeat,
+      role,
+      color: current.color || PLAYER_COLORS[normalizedSeat],
+      id: myPlayerId,
+      authUid: currentAuthUid,
+      name: playerName,
+      connected: true,
+      disconnectedAt: null
+    };
+
+    if (!sameMembership) {
+      Object.assign(nextPlayer, {
+        inGame: false,
+        bankrupt: false,
+        money: role === "player" ? START_MONEY : 0,
+        position: 0,
+        inJail: false,
+        jailAttempts: 0,
+        roulette12Streak: 0,
+        lapsCompleted: 0,
+        jailFreeCards: 0,
+        taxExemptionCards: 0,
+        isHost: false
+      });
+    }
+
+    return nextPlayer;
+  }, undefined, false);
+
+  if (!result.committed) return null;
+
+  return {
+    seat: normalizedSeat,
+    role,
+    reconnectingExistingPlayer: claimMode === "reconnect"
+  };
+}
+
+async function joinRoomByCode(code) {
+  await firebaseReadyPromise;
+  const playerName = getActiveProfileName();
+  const normalizedCode = normalizeRoomCode(code);
+
+  if (!normalizedCode) {
     alert("Masukkan kode room terlebih dahulu.");
     return;
   }
 
   myPlayerId = makePlayerId();
-  roomCode = code;
+  roomCode = normalizedCode;
   roomRef = db.ref(`rooms/${roomCode}`);
 
-  const snap = await roomRef.once("value");
+  let snap = await roomRef.once("value");
   if (!snap.exists()) {
+    roomRef = null;
+    roomCode = "";
     alert("Room tidak ditemukan.");
     return;
   }
 
-  const data = snap.val();
-  const players = data.players || {};
-  let seat = null;
+  let data = snap.val();
+  let players = data.players || {};
+  let existingSeat = null;
 
   for (let i = 0; i < MAX_ROOM_MEMBERS; i++) {
     if (players[i]?.id === myPlayerId && players[i]?.authUid === currentAuthUid) {
-      seat = i;
+      existingSeat = i;
       break;
     }
   }
 
-  const reconnectingExistingPlayer = seat !== null;
+  let claim = null;
 
-  if (seat === null) {
-    const gameAlreadyStarted = data.status !== "lobby";
-    const candidateSeats = gameAlreadyStarted
-      ? [4, 5]
-      : [0, 1, 2, 3, 4, 5];
-
-    seat = candidateSeats.find(index => !players[index]?.id) ?? null;
+  if (existingSeat !== null) {
+    claim = await claimRoomSeatAtomically(existingSeat, playerName, { allowEmpty: false });
   }
 
-  if (seat === null) {
+  if (!claim) {
+    // Baca ulang agar pilihan seat memakai status room terbaru setelah percobaan reconnect.
+    snap = await roomRef.once("value");
+    if (!snap.exists()) {
+      roomRef = null;
+      roomCode = "";
+      alert("Room tidak ditemukan.");
+      return;
+    }
+
+    data = snap.val();
+    players = data.players || {};
+
+    const latestExistingSeat = Array.from({ length: MAX_ROOM_MEMBERS }, (_, index) => index)
+      .find(index => players[index]?.id === myPlayerId && players[index]?.authUid === currentAuthUid);
+
+    if (latestExistingSeat !== undefined) {
+      claim = await claimRoomSeatAtomically(latestExistingSeat, playerName, { allowEmpty: false });
+    }
+
+    if (!claim) {
+      const gameAlreadyStarted = data.status !== "lobby";
+      const candidateSeats = gameAlreadyStarted
+        ? [4, 5]
+        : [0, 1, 2, 3, 4, 5];
+
+      for (const candidateSeat of candidateSeats) {
+        claim = await claimRoomSeatAtomically(candidateSeat, playerName, { allowEmpty: true });
+        if (claim) break;
+      }
+    }
+  }
+
+  if (!claim) {
+    roomRef = null;
+    roomCode = "";
     alert("Room sudah penuh. Maksimal 4 pemain Monopoly dan 2 penonton.");
     return;
   }
 
-  mySeat = Number(seat);
-  const role = mySeat < MAX_GAME_PLAYERS ? "player" : "spectator";
-  const playerUpdates = {
-    seat: mySeat,
-    role,
-    color: players[mySeat]?.color || PLAYER_COLORS[mySeat],
-    id: myPlayerId,
-    authUid: currentAuthUid,
-    name: playerName,
-    connected: true,
-    disconnectedAt: null
-  };
+  mySeat = claim.seat;
+  const role = claim.role;
+  const reconnectingExistingPlayer = claim.reconnectingExistingPlayer;
 
-  if (!reconnectingExistingPlayer) {
-    playerUpdates.inGame = false;
-    playerUpdates.bankrupt = false;
-    playerUpdates.money = role === "player" ? START_MONEY : 0;
-    playerUpdates.position = 0;
-    playerUpdates.inJail = false;
-    playerUpdates.jailAttempts = 0;
-    playerUpdates.roulette12Streak = 0;
-    playerUpdates.lapsCompleted = 0;
-    playerUpdates.jailFreeCards = 0;
-    playerUpdates.taxExemptionCards = 0;
-    playerUpdates.isHost = false;
-  }
-
-  await roomRef.child(`players/${mySeat}`).update(playerUpdates);
   await setupCurrentPresence();
   saveRoomSession(playerName);
 
@@ -1169,11 +1899,19 @@ async function joinRoom() {
     await addRemoteLog(`${playerName} bergabung sebagai ${roleLabel}.`);
   }
 
+  closeAllLobbyModals();
   enterGameView();
   subscribeRoom();
 }
 
+async function joinRoom() {
+  const code = normalizeRoomCode(els.roomCodeInput?.value);
+  await requestJoinRoom(code);
+}
+
 function enterGameView() {
+  stopRoomDirectorySubscription();
+  closeAllLobbyModals();
   els.appRoot?.classList.add("game-active");
   resetLocalAnimationTimeline();
   resetPlayerMoneyAnimations();
@@ -1209,6 +1947,15 @@ function subscribeRoom() {
 
     ensureLobbyHost(roomState);
     scheduleDisconnectExpiry(roomState);
+
+    const connectedMembers = Object.values(roomState.players || {})
+      .filter(player => player?.id && isPlayerConnectedInState(roomState, player));
+    if (connectedMembers.length > 0 && roomState.emptySince) {
+      roomRef.child("emptySince").set(null).catch(error => {
+        console.warn("Gagal membersihkan penanda room kosong.", error);
+      });
+    }
+    scheduleRoomListingSync(roomState);
 
     if (!roomState.propertyState) {
       roomRef.child("propertyState").set(makeInitialPropertyState());
@@ -1531,7 +2278,9 @@ async function rollStartingOrder() {
         source: "starting-order",
         createdAt: Date.now()
       },
-      [`orderRoll/histories/${seat}`]: histories[seat]
+      [`orderRoll/histories/${seat}`]: histories[seat],
+      "orderRoll/activeRollId": rollId,
+      "orderRoll/activeSeat": Number(seat)
     });
     orderRollInProgress = false;
     scheduleStartingOrderFinalization({
@@ -1542,7 +2291,11 @@ async function rollStartingOrder() {
   } catch (error) {
     orderRollInProgress = false;
     console.error("Gagal memproses roulette penentuan giliran.", error);
-    await roomRef.update({ isRolling: false });
+    await roomRef.update({
+      isRolling: false,
+      "orderRoll/activeRollId": null,
+      "orderRoll/activeSeat": null
+    });
   }
 }
 
@@ -1568,35 +2321,83 @@ function scheduleStartingOrderFinalization(stateLike = roomState) {
   }, delay);
 }
 
+async function applyStartingOrderOutcome(order, rollId) {
+  if (!roomRef || !order || !rollId) return false;
+
+  const outcome = order.lastOutcome;
+  if (!outcome
+    || outcome.rollId !== rollId
+    || order.lastProcessedRollId !== rollId) {
+    return false;
+  }
+
+  const updates = { isRolling: false };
+
+  if (outcome.type === "next") {
+    updates.currentSeat = Number(outcome.nextSeat);
+  } else if (outcome.type === "tie") {
+    const tieQueue = normalizeSeatArray(outcome.tieQueue);
+    if (!tieQueue.length) return false;
+    updates.currentSeat = tieQueue[0];
+  } else if (outcome.type === "completed") {
+    const finalOrder = normalizeSeatArray(order.finalOrder);
+    const winnerSeat = Number(outcome.winnerSeat);
+    if (!finalOrder.length || !Number.isInteger(winnerSeat)) return false;
+    updates.status = "playing";
+    updates.currentSeat = winnerSeat;
+    updates.turnOrder = finalOrder;
+  } else {
+    return false;
+  }
+
+  await roomRef.update(updates);
+  return true;
+}
+
 async function finalizeStartingOrderRoll(rollId) {
   if (!roomRef || !rollId) return;
 
-  const transaction = await roomRef.transaction((room) => {
-    if (!room
-      || room.status !== "orderRoll"
-      || !room.isRolling
-      || room.lastRoulette?.source !== "starting-order"
-      || room.lastRoulette?.id !== rollId
-      || room.orderRoll?.lastProcessedRollId === rollId) {
+  // Hanya node orderRoll yang dikunci melalui transaction. Perubahan status,
+  // currentSeat, dan isRolling diterapkan sesudah hasil resolusi berhasil
+  // dikunci. Ini menghindari transaction seluruh room dijalankan bersamaan
+  // oleh setiap browser yang sedang berlangganan ke room yang sama.
+  const orderRef = roomRef.child("orderRoll");
+  const transaction = await orderRef.transaction((orderValue) => {
+    if (!orderValue || orderValue.completed) return;
+
+    const activeRollId = String(orderValue.activeRollId || rollId);
+    if (activeRollId !== rollId || orderValue.lastProcessedRollId === rollId) {
       return;
     }
 
-    const order = room.orderRoll || {};
+    const order = { ...orderValue };
     const queue = normalizeSeatArray(order.queue);
-    const nextIndex = Number(order.currentIndex || 0) + 1;
+    const currentIndex = Number(order.currentIndex || 0);
+    const activeSeat = Number(order.activeSeat ?? queue[currentIndex]);
+
+    if (!queue.length
+      || !Number.isInteger(activeSeat)
+      || Number(queue[currentIndex]) !== activeSeat) {
+      return;
+    }
+
+    const histories = order.histories || {};
+    const activeHistory = normalizeSeatArray(histories[activeSeat]);
+    if (!activeHistory.length) return;
+
+    const nextIndex = currentIndex + 1;
     order.lastProcessedRollId = rollId;
+    order.activeRollId = null;
+    order.activeSeat = null;
 
     if (nextIndex < queue.length) {
       const nextSeat = queue[nextIndex];
       order.currentIndex = nextIndex;
       order.lastOutcome = { type: "next", rollId, nextSeat };
-      room.currentSeat = nextSeat;
-      room.isRolling = false;
-      room.orderRoll = order;
-      return room;
+      return order;
     }
 
-    const stateForRanking = { ...room, orderRoll: order };
+    const stateForRanking = { orderRoll: order };
     const ties = findStartingOrderTies(stateForRanking);
     if (ties.length) {
       const tieQueue = ties.flat().sort((a, b) => a - b);
@@ -1604,10 +2405,7 @@ async function finalizeStartingOrderRoll(rollId) {
       order.currentIndex = 0;
       order.round = Number(order.round || 1) + 1;
       order.lastOutcome = { type: "tie", rollId, tieQueue };
-      room.currentSeat = tieQueue[0];
-      room.isRolling = false;
-      room.orderRoll = order;
-      return room;
+      return order;
     }
 
     const finalOrder = getStartingOrderRanking(stateForRanking);
@@ -1617,28 +2415,39 @@ async function finalizeStartingOrderRoll(rollId) {
     order.resultId = `${rollId}_result`;
     order.completedAt = Date.now();
     order.lastOutcome = { type: "completed", rollId, winnerSeat };
-
-    room.status = "playing";
-    room.isRolling = false;
-    room.currentSeat = winnerSeat;
-    room.turnOrder = finalOrder;
-    room.orderRoll = order;
-    return room;
+    return order;
   });
 
-  if (!transaction.committed) return;
-  const updated = transaction.snapshot.val();
-  const outcome = updated?.orderRoll?.lastOutcome;
+  let updatedOrder = transaction.snapshot?.val() || null;
+
+  // Jika browser lain sudah lebih dahulu mengunci hasil roll, transaction
+  // lokal akan abort. Baca state terbaru dan tetap terapkan outcome yang sama
+  // secara idempoten agar room tidak macet saat browser pemroses terputus.
+  if (!transaction.committed) {
+    const latestSnapshot = await orderRef.once("value");
+    updatedOrder = latestSnapshot.val();
+    if (updatedOrder?.lastProcessedRollId === rollId
+      && updatedOrder?.lastOutcome?.rollId === rollId) {
+      await applyStartingOrderOutcome(updatedOrder, rollId);
+    }
+    return;
+  }
+
+  const outcome = updatedOrder?.lastOutcome;
   if (outcome?.rollId !== rollId) return;
 
+  await applyStartingOrderOutcome(updatedOrder, rollId);
+
   if (outcome.type === "tie") {
+    const latestRoom = (await roomRef.once("value")).val();
     const names = normalizeSeatArray(outcome.tieQueue)
-      .map(seat => updated.players?.[seat]?.name)
+      .map(seat => latestRoom?.players?.[seat]?.name)
       .filter(Boolean);
     await addRemoteLog(`Nilai roulette penentuan giliran seri. ${names.join(", ")} melakukan roulette ulang.`);
   } else if (outcome.type === "completed") {
+    const latestRoom = (await roomRef.once("value")).val();
     const winnerSeat = Number(outcome.winnerSeat);
-    const winnerName = updated.players?.[winnerSeat]?.name || `Pemain ${winnerSeat + 1}`;
+    const winnerName = latestRoom?.players?.[winnerSeat]?.name || `Pemain ${winnerSeat + 1}`;
     await addRemoteLog(`${winnerName} memperoleh urutan pertama dari roulette penentuan giliran.`);
   }
 }
@@ -6918,9 +7727,46 @@ async function leaveRoom() {
     updates[`logs/${leaveLogTimestamp + 1}`] = assetSettlementText;
   }
 
+  const remainingConnectedMembers = Object.values(latest?.players || {})
+    .filter(player => Number(player?.seat) !== Number(mySeat))
+    .filter(player => player?.id && isPlayerConnectedInState(latest, player));
+  const remainingPlayerCount = remainingConnectedMembers.filter(isMonopolyPlayer).length;
+  const remainingSpectatorCount = remainingConnectedMembers.filter(isSpectator).length;
+  const roomWillBeEmpty = remainingConnectedMembers.length === 0;
+  const emptySinceValue = roomWillBeEmpty ? firebase.database.ServerValue.TIMESTAMP : null;
+  updates.emptySince = emptySinceValue;
+  updates.lastActivityAt = firebase.database.ServerValue.TIMESTAMP;
+
+  const leavingRoomCode = roomCode;
+  const listingAfterLeave = {
+    roomCode: leavingRoomCode,
+    roomName: cleanRoomName(latest?.roomName || `Room ${leavingRoomCode}`),
+    visibility: normalizeVisibility(latest?.visibility || "public"),
+    requiresPassword: latest?.requiresPassword === true,
+    status: String(updates.status || latest?.status || "lobby"),
+    playerCount: remainingPlayerCount,
+    spectatorCount: remainingSpectatorCount,
+    maxPlayers: MAX_GAME_PLAYERS,
+    maxSpectators: MAX_ROOM_MEMBERS - MAX_GAME_PLAYERS,
+    createdAt: Number(latest?.createdAt || Date.now()),
+    lastActivityAt: firebase.database.ServerValue.TIMESTAMP,
+    emptySince: emptySinceValue
+  };
+
+  const rootUpdates = {};
+  Object.entries(updates).forEach(([path, value]) => {
+    rootUpdates[`rooms/${leavingRoomCode}/${path}`] = value;
+  });
+  Object.entries(listingAfterLeave).forEach(([key, value]) => {
+    rootUpdates[`roomLookup/${leavingRoomCode}/${key}`] = value;
+  });
+  rootUpdates[`roomDirectory/${leavingRoomCode}`] = listingAfterLeave.visibility === "unlisted"
+    ? null
+    : listingAfterLeave;
+
   await stopVoiceChatNetwork();
   await detachCurrentPresence({ cancelDisconnect: true });
-  await roomRef.update(updates);
+  await db.ref().update(rootUpdates);
 
   resetLocalAnimationTimeline();
   clearRouletteSpinSound();
@@ -6943,6 +7789,9 @@ async function leaveRoom() {
   els.roomBadge.textContent = "Belum masuk room";
   els.copyRoomBtn.disabled = true;
   els.leaveBtn.disabled = true;
+  lastRoomDirectorySignature = "";
+  lastRoomDirectorySyncAt = 0;
+  showLobbyHome();
 }
 
 function handleFirebaseClientError(error, actionLabel = "mengakses room") {
@@ -6954,12 +7803,78 @@ function handleFirebaseClientError(error, actionLabel = "mengakses room") {
   alert(message);
 }
 
+els.confirmProfileBtn?.addEventListener("click", confirmPlayerProfile);
+els.playerNameInput?.addEventListener("keydown", event => {
+  if (event.key === "Enter") confirmPlayerProfile();
+});
+els.editProfileBtn?.addEventListener("click", openEditProfile);
+els.closeEditProfileBtn?.addEventListener("click", () => setOverlayVisible(els.editProfileOverlay, false));
+els.saveProfileBtn?.addEventListener("click", saveEditedProfile);
+els.editPlayerNameInput?.addEventListener("keydown", event => {
+  if (event.key === "Enter") saveEditedProfile();
+});
+
+els.openCreateRoomBtn?.addEventListener("click", openCreateRoomModal);
+els.closeCreateRoomBtn?.addEventListener("click", () => setOverlayVisible(els.createRoomOverlay, false));
+document.querySelectorAll('input[name="roomVisibility"]').forEach(input => {
+  input.addEventListener("change", updateCreateRoomPasswordField);
+});
 els.createRoomBtn.addEventListener("click", () => {
   createRoom().catch(error => handleFirebaseClientError(error, "membuat room"));
 });
-els.joinRoomBtn.addEventListener("click", () => {
-  joinRoom().catch(error => handleFirebaseClientError(error, "bergabung ke room"));
+els.roomNameInput?.addEventListener("keydown", event => {
+  if (event.key === "Enter") createRoom().catch(error => handleFirebaseClientError(error, "membuat room"));
 });
+
+els.openJoinCodeBtn?.addEventListener("click", openJoinCodeModal);
+els.closeJoinCodeBtn?.addEventListener("click", () => setOverlayVisible(els.joinCodeOverlay, false));
+els.joinRoomBtn.addEventListener("click", () => {
+  els.joinRoomBtn.disabled = true;
+  joinRoom()
+    .catch(error => handleFirebaseClientError(error, "bergabung ke room"))
+    .finally(() => {
+      els.joinRoomBtn.disabled = false;
+    });
+});
+els.roomCodeInput?.addEventListener("input", () => {
+  els.roomCodeInput.value = normalizeRoomCode(els.roomCodeInput.value);
+});
+els.roomCodeInput?.addEventListener("keydown", event => {
+  if (event.key === "Enter") els.joinRoomBtn?.click();
+});
+
+els.closeRoomPasswordBtn?.addEventListener("click", () => {
+  setOverlayVisible(els.roomPasswordOverlay, false);
+  pendingJoinContext = null;
+});
+els.confirmRoomPasswordBtn?.addEventListener("click", confirmRoomPassword);
+els.roomPasswordInput?.addEventListener("keydown", event => {
+  if (event.key === "Enter") confirmRoomPassword();
+});
+els.refreshRoomListBtn?.addEventListener("click", () => {
+  refreshRoomDirectory().catch(error => handleFirebaseClientError(error, "memperbarui daftar room"));
+});
+els.roomList?.addEventListener("click", event => {
+  const button = event.target.closest("[data-room-code]");
+  if (!button || button.disabled) return;
+  const code = normalizeRoomCode(button.dataset.roomCode);
+  const entry = normalizeDirectoryEntry(code, latestRoomDirectory?.[code] || {});
+  button.disabled = true;
+  requestJoinRoom(code, entry)
+    .catch(error => handleFirebaseClientError(error, "bergabung ke room"))
+    .finally(() => {
+      if (document.body.contains(button)) button.disabled = false;
+    });
+});
+
+[els.editProfileOverlay, els.createRoomOverlay, els.joinCodeOverlay, els.roomPasswordOverlay].forEach(overlay => {
+  overlay?.addEventListener("click", event => {
+    if (event.target !== overlay) return;
+    setOverlayVisible(overlay, false);
+    if (overlay === els.roomPasswordOverlay) pendingJoinContext = null;
+  });
+});
+
 els.startBtn.addEventListener("click", startGame);
 els.orderRollBtn?.addEventListener("click", handleOrderOverlayButton);
 window.chooseFreeMoveTarget = chooseFreeMoveTarget;
@@ -6979,8 +7894,16 @@ els.historyOverlay?.addEventListener("click", (event) => {
   if (event.target === els.historyOverlay) closeHistoryModal();
 });
 window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && els.historyOverlay && !els.historyOverlay.classList.contains("hidden")) {
+  if (event.key !== "Escape") return;
+  if (els.historyOverlay && !els.historyOverlay.classList.contains("hidden")) {
     closeHistoryModal();
+    return;
+  }
+  const openLobbyOverlay = [els.roomPasswordOverlay, els.createRoomOverlay, els.joinCodeOverlay, els.editProfileOverlay]
+    .find(overlay => overlay && !overlay.classList.contains("hidden"));
+  if (openLobbyOverlay) {
+    setOverlayVisible(openLobbyOverlay, false);
+    if (openLobbyOverlay === els.roomPasswordOverlay) pendingJoinContext = null;
   }
 });
 els.cardCloseBtn.addEventListener("click", closeCardAndFinishTurn);
@@ -6993,15 +7916,22 @@ document.addEventListener("pointerdown", unlockVoiceAudioPlayback, { passive: tr
 document.addEventListener("touchstart", unlockVoiceAudioPlayback, { passive: true });
 document.addEventListener("keydown", unlockVoiceAudioPlayback);
 
-els.createRoomBtn.disabled = true;
-els.joinRoomBtn.disabled = true;
+[els.createRoomBtn, els.joinRoomBtn, els.openCreateRoomBtn, els.openJoinCodeBtn, els.refreshRoomListBtn]
+  .filter(Boolean)
+  .forEach(button => { button.disabled = true; });
 
+initializeLobbyFlow();
 firebaseReadyPromise = initFirebase();
 firebaseReadyPromise
   .then(async () => {
-    els.createRoomBtn.disabled = false;
-    els.joinRoomBtn.disabled = false;
-    await restoreRoomSession();
+    [els.createRoomBtn, els.joinRoomBtn, els.openCreateRoomBtn, els.openJoinCodeBtn, els.refreshRoomListBtn]
+      .filter(Boolean)
+      .forEach(button => { button.disabled = false; });
+    const restored = await restoreRoomSession();
+    if (!els.appRoot?.classList.contains("game-active")) {
+      showLobbyHome();
+    }
+    return restored;
   })
   .catch((error) => {
     console.error("Firebase gagal diinisialisasi.", error);

@@ -1,4 +1,4 @@
-# Monopoly Board Game Online
+# At Thohiriyah Monopoly Board Game Online
 
 Game papan multiplayer berbasis:
 - **Phaser 3** untuk papan, interaksi petak, dan animasi pion;
@@ -7,7 +7,11 @@ Game papan multiplayer berbasis:
 
 ## Fitur saat ini
 
-- Buat room dan join menggunakan kode;
+- Profil nama pemain tersimpan di browser dan dapat diedit dari lobby;
+- Room Browser realtime dengan room Public, Private, dan Unlisted;
+- Buat room memakai nama room, visibilitas, serta password opsional sesuai tipe room;
+- Join room melalui kartu Room List atau kode khusus untuk room Unlisted;
+- klaim kursi atomik untuk mencegah dua perangkat menimpa seat yang sama;
 - maksimal 4 pemain Monopoly dan 2 penonton;
 - host memulai permainan;
 - giliran tersinkron secara realtime;
@@ -27,32 +31,55 @@ Game papan multiplayer berbasis:
 - tampilan responsive untuk iPhone, Android, dan tablet;
 - layout landscape-first dengan mode portrait yang tetap dapat digunakan.
 
+## Lobby dan tipe room
+
+Setelah nama pemain dikonfirmasi, pengguna langsung masuk ke halaman **Room List**. Daftar diperbarui secara realtime dan diurutkan berdasarkan jumlah pemain terbanyak, kemudian status lobby, jumlah spectator, dan aktivitas terbaru.
+
+- **Public 🌐** muncul pada Room List dan dapat dimasuki tanpa password.
+- **Private 🔒** muncul pada Room List, tetapi membutuhkan password sebelum klaim seat dilakukan.
+- **Unlisted 🔗** tidak muncul pada Room List dan hanya dapat dibuka melalui menu **Masuk dengan Kode**. Password bersifat opsional.
+
+Room yang sudah mulai hanya menerima spectator pada seat 5–6. Room lobby dengan empat pemain masih dapat menerima spectator apabila slot penonton tersedia. Proses join tetap memakai Firebase transaction sehingga seat terakhir tidak dapat direbut dua browser secara bersamaan.
+
+Password tidak disimpan sebagai teks biasa. Client membuat bukti SHA-256 dengan salt, sedangkan hash pembanding disimpan pada node `roomSecrets` yang tidak dapat dibaca client. Model ini cukup untuk lobby MVP, tetapi belum memiliki rate limiting server; untuk production dengan ancaman brute-force, pindahkan verifikasi password ke callable Cloud Function.
+
+## Penghapusan room kosong
+
+Function `cleanupInactiveRooms` berjalan terjadwal dan memeriksa node presence aktual. Room ditandai kosong hanya setelah tidak ada koneksi aktif. Setelah kosong selama **5 menit**, function menghapus:
+
+- `rooms/{roomCode}`;
+- `roomDirectory/{roomCode}`;
+- `roomLookup/{roomCode}`;
+- `roomSecrets/{roomCode}`;
+- `roomAccess/{roomCode}`;
+- `voiceSignals/{roomCode}`.
+
+Masa lima menit berada jauh di atas grace reconnect 30 detik sehingga refresh, perpindahan jaringan singkat, atau browser yang sesaat berada di background tidak langsung menghapus room.
+
 ## Cara setup Firebase
 
-1. Buka Firebase Console.
-2. Buat project baru.
-3. Masuk ke **Build > Realtime Database**.
-4. Klik **Create Database** dan pilih region terdekat.
-5. Untuk testing awal, rules berikut dapat digunakan:
+1. Buka Firebase Console dan buat project.
+2. Aktifkan **Authentication > Sign-in method > Anonymous**.
+3. Aktifkan **Realtime Database**.
+4. Tambahkan Web App dan salin konfigurasi ke `firebase-config.js`.
+5. Deploy rules terbaru dari root project:
 
-```json
-{
-  "rules": {
-    "rooms": {
-      "$roomId": {
-        ".read": true,
-        ".write": true
-      }
-    }
-  }
-}
+```bash
+npx firebase-tools login
+npx firebase-tools use at-thohiriyah-board-game
+npx firebase-tools deploy --only database
 ```
 
-> Rules tersebut hanya sesuai untuk testing. Sebelum game dipublikasikan, tambahkan autentikasi dan rules validasi agar pemain tidak dapat mengubah state milik pemain lain.
+6. Install dependency function dan deploy cleanup room:
 
-6. Masuk ke **Project Settings**.
-7. Tambahkan Web App.
-8. Salin konfigurasi `firebaseConfig` ke `firebase-config.js`.
+```bash
+cd functions
+npm install
+cd ..
+npx firebase-tools deploy --only functions:cleanupInactiveRooms
+```
+
+Frontend lobby tetap dapat digunakan tanpa function cleanup, tetapi room kosong tidak akan terhapus otomatis secara andal apabila tidak ada browser yang masih aktif.
 
 ## Menjalankan secara lokal
 
@@ -121,20 +148,12 @@ Perubahan ini tidak mengubah aturan Parkir Bebas, animasi saldo, suara koin, mar
 Riwayat hanya menyimpan maksimal **22 kejadian penting terbaru**. Pergerakan pion, hasil roulette rutin, dan perpindahan giliran tidak dicatat. Riwayat tetap mencatat transaksi uang, sewa, pajak, pembelian properti, pembangunan rumah/hotel, pengambilan kartu, penjara, Parkir Bebas, pemain bergabung/keluar, serta hasil permainan.
 
 
-
-## Pemain keluar saat permainan berlangsung
-
-- Semua properti milik pemain yang keluar, termasuk rumah dan hotel, dikembalikan ke bank.
-- Sisa uang tunai pemain dibagi rata kepada seluruh pemain Monopoly yang masih aktif.
-- Pembagian selalu menggunakan bilangan bulat ke bawah. Sisa yang tidak dapat dibagi rata dihapus agar saldo tidak menjadi pecahan.
-- Aturan yang sama berlaku ketika pemain menekan tombol **Keluar** maupun saat otomatis dikeluarkan karena terputus lebih dari 30 detik.
-
 ## Revisi utilitas, rumah, popup, dan penjara
 
 - Sewa Perusahaan Air dan Perusahaan Listrik tidak lagi mengikuti hasil roulette. Satu perusahaan mengenakan sewa 2× nilai hipotik ($150), sedangkan kepemilikan kedua perusahaan mengenakan sewa 5× nilai hipotik ($375).
 - Penanda rumah dan hotel selalu disusun horizontal dari kiri ke kanan pada semua sisi papan.
 - Popup detail properti diperkecil menjadi sekitar tiga perempat lebar sebelumnya.
-- Percobaan keluar penjara tanpa membayar menggunakan roulette dibatasi satu kali per giliran. Pemain langsung bebas jika mendapat angka 12. Jika belum mendapat 12 sampai percobaan ketiga, pemain otomatis bebas dan langsung bergerak sesuai hasil roulette ketiga.
+- Percobaan keluar penjara tanpa membayar menggunakan roulette. Pemain bebas jika mendapat angka 12; jika gagal tiga kali, pemain tetap dibebaskan pada percobaan ketiga.
 
 ## Perbaikan sentuhan Parkir Bebas di iPhone
 
@@ -236,7 +255,7 @@ Timestamp timeline disimpan pada `lastMove.presentation`, sehingga refresh atau 
 - Mendarat pada petak Masuk Penjara menampilkan popup sebelum giliran dilanjutkan.
 - Pembayaran sewa antar pemain menampilkan notifikasi selama lima detik di bagian bawah tengah papan.
 - Roulette memiliki efek suara putaran melalui Web Audio API tanpa file audio tambahan.
-- Untuk kompleks lengkap, tarif efektif mengikuti aturan terbaru: tarif kompleks yang tampil pada tabel dikalikan dua lagi saat sewa aktual dihitung.
+- Untuk kompleks lengkap, daftar popup tetap menampilkan tarif dasar dan sewa aktual dikalikan 2× tepat satu kali.
 
 ## Deck Dana Umum dan Kesempatan V20
 
