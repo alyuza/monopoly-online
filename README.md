@@ -1,4 +1,4 @@
-# At Thohiriyah Monopoly Board Game Online
+# Monopoly Board Game Online
 
 Game papan multiplayer berbasis:
 - **Phaser 3** untuk papan, interaksi petak, dan animasi pion;
@@ -121,12 +121,20 @@ Perubahan ini tidak mengubah aturan Parkir Bebas, animasi saldo, suara koin, mar
 Riwayat hanya menyimpan maksimal **22 kejadian penting terbaru**. Pergerakan pion, hasil roulette rutin, dan perpindahan giliran tidak dicatat. Riwayat tetap mencatat transaksi uang, sewa, pajak, pembelian properti, pembangunan rumah/hotel, pengambilan kartu, penjara, Parkir Bebas, pemain bergabung/keluar, serta hasil permainan.
 
 
+
+## Pemain keluar saat permainan berlangsung
+
+- Semua properti milik pemain yang keluar, termasuk rumah dan hotel, dikembalikan ke bank.
+- Sisa uang tunai pemain dibagi rata kepada seluruh pemain Monopoly yang masih aktif.
+- Pembagian selalu menggunakan bilangan bulat ke bawah. Sisa yang tidak dapat dibagi rata dihapus agar saldo tidak menjadi pecahan.
+- Aturan yang sama berlaku ketika pemain menekan tombol **Keluar** maupun saat otomatis dikeluarkan karena terputus lebih dari 30 detik.
+
 ## Revisi utilitas, rumah, popup, dan penjara
 
 - Sewa Perusahaan Air dan Perusahaan Listrik tidak lagi mengikuti hasil roulette. Satu perusahaan mengenakan sewa 2× nilai hipotik ($150), sedangkan kepemilikan kedua perusahaan mengenakan sewa 5× nilai hipotik ($375).
 - Penanda rumah dan hotel selalu disusun horizontal dari kiri ke kanan pada semua sisi papan.
 - Popup detail properti diperkecil menjadi sekitar tiga perempat lebar sebelumnya.
-- Percobaan keluar penjara tanpa membayar menggunakan roulette. Pemain bebas jika mendapat angka 12; jika gagal tiga kali, pemain tetap dibebaskan pada percobaan ketiga.
+- Percobaan keluar penjara tanpa membayar menggunakan roulette dibatasi satu kali per giliran. Pemain langsung bebas jika mendapat angka 12. Jika belum mendapat 12 sampai percobaan ketiga, pemain otomatis bebas dan langsung bergerak sesuai hasil roulette ketiga.
 
 ## Perbaikan sentuhan Parkir Bebas di iPhone
 

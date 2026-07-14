@@ -253,6 +253,9 @@ let freeMoveSelectionStarting = false;
 let freeMoveTapInProgress = false;
 let debtSaleInProgress = false;
 let jailRouletteInProgress = false;
+let jailRouletteResolutionTimer = null;
+let jailRouletteResolutionRunning = false;
+let scheduledJailRouletteId = "";
 let suppressBoardInputUntil = 0;
 let lastBoardTapIndex = null;
 let lastBoardTapAt = 0;
@@ -497,12 +500,119 @@ function getExpiredDisconnectedSeats(stateLike = roomState, now = Date.now()) {
     .map(player => Number(player.seat));
 }
 
-function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 30 detik") {
+function getLeavingAssetSettlement(stateLike, leavingSeat, excludedRecipientSeats = []) {
+  const normalizedSeat = Number(leavingSeat);
+  const leavingPlayer = stateLike?.players?.[normalizedSeat];
+  if (!leavingPlayer || stateLike?.status !== "playing" || !isPlayerGameParticipant(leavingPlayer, stateLike)) {
+    return {
+      recipientSeats: [],
+      ownedPropertyIds: [],
+      availableMoney: 0,
+      sharePerPlayer: 0,
+      distributedMoney: 0,
+      discardedRemainder: 0
+    };
+  }
+
+  const excludedSeats = new Set(normalizeSeatArray(excludedRecipientSeats).map(Number));
+  const recipientSeats = getTurnOrderFromState(stateLike)
+    .filter(seat => Number(seat) !== normalizedSeat)
+    .filter(seat => !excludedSeats.has(Number(seat)))
+    .filter(seat => isPlayerGameParticipant(stateLike?.players?.[seat], stateLike));
+
+  const ownedPropertyIds = Object.keys(PROPERTY_DATA).filter(propertyId => {
+    const owner = stateLike?.propertyState?.[propertyId]?.owner;
+    return owner !== null && owner !== undefined && Number(owner) === normalizedSeat;
+  });
+
+  const availableMoney = Math.max(0, Math.floor(Number(leavingPlayer.money || 0)));
+  const sharePerPlayer = recipientSeats.length > 0
+    ? Math.floor(availableMoney / recipientSeats.length)
+    : 0;
+  const distributedMoney = sharePerPlayer * recipientSeats.length;
+
+  return {
+    recipientSeats,
+    ownedPropertyIds,
+    availableMoney,
+    sharePerPlayer,
+    distributedMoney,
+    discardedRemainder: availableMoney - distributedMoney
+  };
+}
+
+function appendLeavingAssetSettlementUpdates(stateLike, leavingSeat, updates) {
+  const settlement = getLeavingAssetSettlement(stateLike, leavingSeat);
+
+  settlement.ownedPropertyIds.forEach(propertyId => {
+    updates[`propertyState/${propertyId}/owner`] = null;
+    updates[`propertyState/${propertyId}/level`] = 0;
+  });
+
+  settlement.recipientSeats.forEach(seat => {
+    const currentMoney = Number(stateLike?.players?.[seat]?.money || 0);
+    updates[`players/${seat}/money`] = currentMoney + settlement.sharePerPlayer;
+  });
+
+  if (stateLike?.status === "playing" && stateLike?.players?.[leavingSeat]) {
+    updates[`players/${leavingSeat}/money`] = 0;
+  }
+
+  return settlement;
+}
+
+function applyLeavingAssetSettlementToRoom(room, leavingSeat, excludedRecipientSeats = []) {
+  const settlement = getLeavingAssetSettlement(room, leavingSeat, excludedRecipientSeats);
+
+  settlement.ownedPropertyIds.forEach(propertyId => {
+    if (!room.propertyState?.[propertyId]) return;
+    room.propertyState[propertyId].owner = null;
+    room.propertyState[propertyId].level = 0;
+  });
+
+  settlement.recipientSeats.forEach(seat => {
+    const recipient = room.players?.[seat];
+    if (!recipient) return;
+    recipient.money = Number(recipient.money || 0) + settlement.sharePerPlayer;
+  });
+
+  if (room.players?.[leavingSeat]) {
+    room.players[leavingSeat].money = 0;
+  }
+
+  return settlement;
+}
+
+function describeLeavingAssetSettlement(settlement) {
+  if (!settlement) return "";
+
+  const parts = [];
+  const propertyCount = settlement.ownedPropertyIds.length;
+  if (propertyCount > 0) {
+    parts.push(`${propertyCount} properti dikembalikan ke bank`);
+  }
+
+  if (settlement.availableMoney > 0 && settlement.recipientSeats.length > 0) {
+    let moneyText = `${formatMoney(settlement.availableMoney)} dibagi kepada ${settlement.recipientSeats.length} pemain, masing-masing menerima ${formatMoney(settlement.sharePerPlayer)}`;
+    if (settlement.discardedRemainder > 0) {
+      moneyText += `, sedangkan sisa ${formatMoney(settlement.discardedRemainder)} dihapus`;
+    }
+    parts.push(moneyText);
+  }
+
+  return parts.length ? `${parts.join(". ")}.` : "";
+}
+
+function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 30 detik", excludedRecipientSeats = []) {
   if (!room?.players?.[seat]) return room;
 
   const leavingPlayer = room.players[seat];
   const wasParticipant = isPlayerGameParticipant(leavingPlayer, room);
   const originalOrder = getTurnOrderFromState(room);
+  const assetSettlement = room.status === "playing" && wasParticipant
+    ? applyLeavingAssetSettlementToRoom(room, seat, excludedRecipientSeats)
+    : null;
+  const assetSettlementText = describeLeavingAssetSettlement(assetSettlement);
 
   leavingPlayer.connected = false;
   leavingPlayer.id = "";
@@ -558,7 +668,7 @@ function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 3
         deckType: "system",
         deck: "Game Selesai",
         title: winnerSeat !== null ? `${room.players?.[winnerSeat]?.name || "Pemain terakhir"} Menang!` : "Game Selesai",
-        text: `${leavingPlayer.name || "Seorang pemain"} keluar karena tidak kembali dalam 30 detik.`,
+        text: `${leavingPlayer.name || "Seorang pemain"} keluar karena tidak kembali dalam 30 detik.${assetSettlementText ? ` ${assetSettlementText}` : ""}`,
         seat: winnerSeat,
         playerName: winnerSeat !== null ? room.players?.[winnerSeat]?.name : ""
       };
@@ -566,6 +676,7 @@ function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 3
       if (Number(room.currentSeat) === Number(seat)) {
         const leavingIndex = originalOrder.indexOf(Number(seat));
         room.currentSeat = remaining[(Math.max(0, leavingIndex) % remaining.length)];
+        room.isRolling = false;
       }
       if (room.pendingAction && Number(room.pendingAction.seat) === Number(seat)) {
         room.pendingAction = null;
@@ -580,7 +691,7 @@ function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 3
         deckType: "system",
         deck: "Info Game",
         title: `${leavingPlayer.name || "Pemain"} Keluar`,
-        text: `Pemain dikeluarkan karena ${reasonText}. Permainan dilanjutkan.`,
+        text: `Pemain dikeluarkan karena ${reasonText}. Permainan dilanjutkan.${assetSettlementText ? ` ${assetSettlementText}` : ""}`,
         seat,
         playerName: leavingPlayer.name || "Pemain"
       };
@@ -598,7 +709,11 @@ function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 3
   }
 
   room.logs = room.logs || {};
-  room.logs[Date.now()] = `${leavingPlayer.name || "Pemain"} dikeluarkan karena terputus lebih dari 30 detik.`;
+  const logTimestamp = Date.now();
+  room.logs[logTimestamp] = `${leavingPlayer.name || "Pemain"} dikeluarkan karena ${reasonText}.`;
+  if (assetSettlementText) {
+    room.logs[logTimestamp + 1] = assetSettlementText;
+  }
   return room;
 }
 
@@ -611,7 +726,7 @@ async function expireDisconnectedPlayers() {
       if (!room) return room;
       const expiredSeats = getExpiredDisconnectedSeats(room, Date.now());
       if (!expiredSeats.length) return;
-      expiredSeats.forEach(seat => removeSeatFromRoomState(room, seat));
+      expiredSeats.forEach(seat => removeSeatFromRoomState(room, seat, "terputus lebih dari 30 detik", expiredSeats));
       return room;
     });
   } catch (error) {
@@ -1115,6 +1230,7 @@ function subscribeRoom() {
     maybeAnimateLastMove();
     scheduleMovePresentationUi(roomState);
     scheduleActiveMoveResolution(roomState);
+    scheduleJailRouletteResolution(roomState);
     scheduleStartingOrderFinalization(roomState);
   });
 }
@@ -1602,6 +1718,7 @@ function resetLocalAnimationTimeline() {
   if (rouletteRevealTimer) clearTimeout(rouletteRevealTimer);
   if (moveEffectsRevealTimer) clearTimeout(moveEffectsRevealTimer);
   if (activeMoveResolutionTimer) clearTimeout(activeMoveResolutionTimer);
+  clearJailRouletteResolutionTimer();
   movePresentationUiTimers.forEach(timer => clearTimeout(timer));
   movePresentationUiTimers = [];
   movePresentationUiMoveId = "";
@@ -2810,76 +2927,282 @@ async function payJailFine() {
 }
 
 
+function clearJailRouletteResolutionTimer() {
+  if (jailRouletteResolutionTimer) {
+    clearTimeout(jailRouletteResolutionTimer);
+  }
+  jailRouletteResolutionTimer = null;
+  scheduledJailRouletteId = "";
+}
+
+function scheduleJailRouletteResolution(stateLike = roomState) {
+  const roulette = stateLike?.lastRoulette;
+  const rouletteSeat = Number(roulette?.seat ?? stateLike?.currentSeat);
+  const player = stateLike?.players?.[rouletteSeat];
+  const canResolve = Boolean(
+    roomRef
+    && stateLike?.status === "playing"
+    && stateLike?.isRolling
+    && roulette?.id
+    && roulette?.source === "jail"
+    && rouletteSeat === Number(mySeat)
+    && Number(stateLike.currentSeat) === Number(mySeat)
+    && player?.inJail
+    && !player?.bankrupt
+  );
+
+  if (!canResolve) {
+    if (scheduledJailRouletteId && scheduledJailRouletteId !== roulette?.id) {
+      clearJailRouletteResolutionTimer();
+    }
+    return;
+  }
+
+  if (scheduledJailRouletteId === roulette.id
+    && (jailRouletteResolutionTimer || jailRouletteResolutionRunning)) return;
+
+  clearJailRouletteResolutionTimer();
+  scheduledJailRouletteId = roulette.id;
+  jailRouletteInProgress = true;
+
+  const revealAt = Number(roulette.revealAt || (Number(roulette.createdAt || Date.now()) + ROULETTE_SPIN_MS));
+  const delay = Math.max(80, revealAt - Date.now() + 120);
+
+  jailRouletteResolutionTimer = setTimeout(async () => {
+    jailRouletteResolutionTimer = null;
+    jailRouletteResolutionRunning = true;
+    const resolvingId = scheduledJailRouletteId;
+
+    try {
+      await resolveJailRoulette(resolvingId);
+    } catch (error) {
+      console.error("Gagal menyelesaikan roulette penjara.", error);
+    } finally {
+      if (scheduledJailRouletteId === resolvingId) {
+        scheduledJailRouletteId = "";
+      }
+      jailRouletteResolutionRunning = false;
+      jailRouletteInProgress = false;
+
+      // Jika request sempat gagal sebelum state berubah, snapshot terbaru akan
+      // dijadwalkan ulang. Pada proses sukses validasi resolver langsung berhenti.
+      setTimeout(() => scheduleJailRouletteResolution(roomState), 180);
+    }
+  }, delay);
+}
+
+function appendMoveRevealTimeline(updates, presentation) {
+  if (updates.cardPopup) {
+    updates.cardPopup = {
+      ...updates.cardPopup,
+      revealAt: presentation.effectsRevealAt
+    };
+  }
+  if (updates.pendingAction) {
+    updates.pendingAction = {
+      ...updates.pendingAction,
+      revealAt: presentation.effectsRevealAt
+    };
+  }
+  if (updates.debtState) {
+    updates.debtState = {
+      ...updates.debtState,
+      revealAt: presentation.effectsRevealAt
+    };
+  }
+  if (updates.playerPaymentNotice) {
+    updates.playerPaymentNotice = {
+      ...updates.playerPaymentNotice,
+      revealAt: presentation.effectsRevealAt
+    };
+  }
+}
+
+async function moveAfterThirdJailAttempt(latest, roulette) {
+  const seat = Number(roulette.seat ?? mySeat);
+  const player = latest?.players?.[seat];
+  if (!player?.inJail || Number(latest.currentSeat) !== seat) return;
+
+  roomState = latest;
+
+  const result = Number(roulette.result || 0);
+  const from = Number(player.position || 10);
+  const to = (from + result) % BOARD_SIZE;
+  const passedStart = from + result >= BOARD_SIZE;
+  const previousLaps = Number(player.lapsCompleted || 0);
+  const nextLaps = previousLaps + (passedStart ? 1 : 0);
+  const boardActiveAfterMove = previousLaps >= 1 || passedStart;
+  const completedFirstLap = previousLaps < 1 && passedStart;
+  const createdAt = Number(roulette.createdAt || Date.now());
+  const presentation = makeRouletteMovePresentation(createdAt, from, result, passedStart);
+
+  let playerMoney = Number(player.money || 0) + (passedStart ? PASS_START_BONUS : 0);
+  const updates = {
+    isRolling: true,
+    lastDice: [0, result],
+    lastRoulette: {
+      ...roulette,
+      source: "jail-release",
+      revealAt: presentation.rouletteRevealAt
+    },
+    lastMove: {
+      id: roulette.id,
+      seat,
+      from,
+      to,
+      steps: result,
+      dice: [0, result],
+      passedStart,
+      startBonus: passedStart ? PASS_START_BONUS : 0,
+      presentation,
+      createdAt
+    },
+    pendingAction: null,
+    pendingExtraRoll: null
+  };
+
+  updates[`players/${seat}/position`] = to;
+  updates[`players/${seat}/money`] = playerMoney;
+  updates[`players/${seat}/lapsCompleted`] = nextLaps;
+  updates[`players/${seat}/inJail`] = false;
+  updates[`players/${seat}/jailAttempts`] = 0;
+  updates[`players/${seat}/roulette12Streak`] = 0;
+
+  const logs = [
+    `${player.name} menyelesaikan percobaan roulette penjara ke-3, bebas dari penjara, dan langsung bergerak ${result} langkah dari petak ${from} ke petak ${to}.`
+  ];
+
+  if (passedStart) {
+    logs.push(`${player.name} melewati START dan menerima $200.`);
+  }
+
+  if (completedFirstLap) {
+    logs.push(`${player.name} menyelesaikan putaran pertama. Seluruh petak kini aktif untuk pemain ini.`);
+  }
+
+  if (boardActiveAfterMove) {
+    playerMoney = applyLandingEffect(to, seat, playerMoney, result, updates, logs);
+  }
+
+  appendMoveRevealTimeline(updates, presentation);
+  updates[`players/${seat}/money`] = playerMoney;
+
+  await roomRef.update(updates);
+  await addLogs(logs);
+
+  scheduleActiveMoveResolution({
+    status: "playing",
+    isRolling: true,
+    lastMove: updates.lastMove
+  });
+}
+
+async function resolveJailRoulette(rouletteId) {
+  if (!roomRef || !rouletteId) return;
+
+  const latest = (await roomRef.once("value")).val();
+  const roulette = latest?.lastRoulette;
+  const seat = Number(roulette?.seat ?? latest?.currentSeat);
+  const player = latest?.players?.[seat];
+
+  if (!latest
+    || latest.status !== "playing"
+    || !latest.isRolling
+    || roulette?.id !== rouletteId
+    || roulette?.source !== "jail"
+    || seat !== Number(mySeat)
+    || Number(latest.currentSeat) !== seat
+    || !player?.inJail
+    || player?.bankrupt) {
+    return;
+  }
+
+  const result = Number(roulette.result || 0);
+  const attempts = Math.max(1, Number(roulette.attempt || (Number(player.jailAttempts || 0) + 1)));
+
+  // Percobaan ketiga selalu membebaskan pemain dan hasil roulette yang sama
+  // langsung dipakai untuk menggerakkan pion. Tidak ada roulette tambahan.
+  if (attempts >= 3) {
+    await moveAfterThirdJailAttempt(latest, roulette);
+    return;
+  }
+
+  if (result === 12) {
+    // Pertahankan lock sampai seluruh proses keberhasilan selesai agar tidak ada
+    // aksi lain yang menyela sebelum status penjara benar-benar dibersihkan.
+    await addRemoteLog(`${player.name} mendapat angka 12 pada roulette penjara dan bebas dari penjara. Pemain dapat langsung bermain pada giliran ini.`);
+    await roomRef.update({
+      [`players/${seat}/inJail`]: false,
+      [`players/${seat}/jailAttempts`]: 0,
+      [`players/${seat}/roulette12Streak`]: 0,
+      [`lastRoulette/source`]: "jail-success",
+      isRolling: false
+    });
+    return;
+  }
+
+  // Pada percobaan pertama dan kedua, isRolling sengaja tetap true sampai
+  // finishTurn memindahkan currentSeat. Ini menutup celah yang sebelumnya
+  // membuat pemain dapat menekan roulette berulang kali dalam satu giliran.
+  await roomRef.update({
+    [`players/${seat}/jailAttempts`]: attempts
+  });
+  await addRemoteLog(`${player.name} gagal keluar dari penjara karena roulette mendapat angka ${result}. Percobaan ${attempts}/3; giliran langsung berpindah.`);
+  await finishTurn();
+}
+
 async function rollForJailRoulette() {
   if (!canIUseJailAction() || jailRouletteInProgress) return;
   jailRouletteInProgress = true;
 
-  const player = roomState.players[mySeat];
   const result = Math.floor(Math.random() * 12) + 1;
-  const attempts = Number(player.jailAttempts || 0) + 1;
-  const rouletteId = `${Date.now()}_${mySeat}_jail_${Math.random().toString(16).slice(2)}`;
-  const previousRotation = Number(roomState.lastRoulette?.rotation || 0);
-  const rotation = getRouletteFinalRotation(previousRotation, result);
+  const createdAt = Date.now();
+  const rouletteId = `${createdAt}_${mySeat}_jail_${Math.random().toString(16).slice(2)}`;
 
   try {
-    await roomRef.update({
-      isRolling: true,
-      lastDice: [0, result],
-      lastRoulette: {
+    const transaction = await roomRef.transaction(room => {
+      const player = room?.players?.[mySeat];
+      if (!room
+        || room.status !== "playing"
+        || Number(room.currentSeat) !== Number(mySeat)
+        || room.isRolling
+        || room.pendingAction
+        || room.debtState
+        || !player?.inJail
+        || player?.bankrupt) {
+        return;
+      }
+
+      const attempts = Number(player.jailAttempts || 0) + 1;
+      const previousRotation = Number(room.lastRoulette?.rotation || 0);
+      const rotation = getRouletteFinalRotation(previousRotation, result);
+
+      room.isRolling = true;
+      room.pendingExtraRoll = null;
+      room.lastDice = [0, result];
+      room.lastRoulette = {
         id: rouletteId,
         result,
         rotation,
-        createdAt: Date.now(),
-        source: "jail"
-      }
+        createdAt,
+        revealAt: createdAt + ROULETTE_SPIN_MS,
+        source: "jail",
+        seat: Number(mySeat),
+        attempt: attempts
+      };
+      return room;
     });
+
+    if (!transaction.committed) {
+      jailRouletteInProgress = false;
+      return;
+    }
+
+    scheduleJailRouletteResolution(transaction.snapshot.val());
   } catch (error) {
     jailRouletteInProgress = false;
     throw error;
   }
-
-  setTimeout(async () => {
-    try {
-      const latest = (await roomRef.once("value")).val();
-    if (!latest?.lastRoulette || latest.lastRoulette.id !== rouletteId) return;
-
-    const latestPlayer = latest.players?.[mySeat];
-    if (!latestPlayer?.inJail) {
-      await roomRef.update({ isRolling: false });
-      return;
-    }
-
-    if (result === 12) {
-      await roomRef.update({
-        [`players/${mySeat}/inJail`]: false,
-        [`players/${mySeat}/jailAttempts`]: 0,
-        isRolling: false
-      });
-      await addRemoteLog(`${latestPlayer.name} mendapat angka 12 pada roulette penjara dan bebas dari penjara. Pemain dapat langsung bermain pada giliran ini.`);
-      return;
-    }
-
-    if (attempts >= 3) {
-      await roomRef.update({
-        [`players/${mySeat}/inJail`]: false,
-        [`players/${mySeat}/jailAttempts`]: 0,
-        isRolling: false
-      });
-      await addRemoteLog(`${latestPlayer.name} gagal mendapat angka 12 pada percobaan penjara ke-3 dan dibebaskan. Giliran ini selesai; pemain dapat bermain normal pada giliran berikutnya.`);
-      await finishTurn();
-      return;
-    }
-
-      await roomRef.update({
-        [`players/${mySeat}/jailAttempts`]: attempts,
-        isRolling: false
-      });
-      await addRemoteLog(`${latestPlayer.name} gagal keluar dari penjara karena roulette mendapat angka ${result}. Percobaan ${attempts}/3.`);
-      await finishTurn();
-    } finally {
-      jailRouletteInProgress = false;
-    }
-  }, ROULETTE_SPIN_MS + 120);
 }
 
 async function buyCurrentProperty() {
@@ -3413,7 +3736,7 @@ function renderActionPanel() {
       <div class="action-title">${escapeHTML(player.name)} di Penjara</div>
       <div class="action-sub">
         Percobaan keluar: ${Number(player.jailAttempts || 0)}/3. Setiap giliran hanya tersedia satu percobaan roulette.
-        Dapatkan angka 12 untuk langsung bebas. Setelah percobaan ke-3 gagal, pemain dibebaskan dan baru bermain normal pada giliran berikutnya.
+        Dapatkan angka 12 untuk langsung bebas. Pada percobaan ke-3, pemain otomatis bebas dan langsung maju sesuai hasil roulette tersebut.
       </div>
       ${jailCards > 0 ? `
         <div class="action-row single">
@@ -6451,6 +6774,10 @@ async function leaveRoom() {
 
   const participantSeats = getActiveSeatsFromState(latest);
   const remainingParticipants = participantSeats.filter(seat => seat !== Number(mySeat));
+  const assetSettlement = latest?.status === "playing" && isPlayerGameParticipant(leavingPlayer, latest)
+    ? appendLeavingAssetSettlementUpdates(latest, mySeat, updates)
+    : null;
+  const assetSettlementText = describeLeavingAssetSettlement(assetSettlement);
 
   updates[`players/${mySeat}/connected`] = false;
   updates[`players/${mySeat}/id`] = "";
@@ -6544,7 +6871,7 @@ async function leaveRoom() {
         deckType: "system",
         deck: "Game Selesai",
         title: winnerSeat !== null ? `${winnerName} Menang!` : "Game Selesai",
-        text: `${leavingPlayer?.name || "Seorang pemain"} keluar dari permainan.`,
+        text: `${leavingPlayer?.name || "Seorang pemain"} keluar dari permainan.${assetSettlementText ? ` ${assetSettlementText}` : ""}`,
         seat: winnerSeat,
         playerName: winnerName
       };
@@ -6557,6 +6884,7 @@ async function leaveRoom() {
           ? currentOrder[((leavingIndex >= 0 ? leavingIndex : 0) % currentOrder.length)]
           : null;
         updates.currentSeat = nextSeat;
+        updates.isRolling = false;
       }
 
       if (latest.pendingAction && Number(latest.pendingAction.seat) === Number(mySeat)) {
@@ -6574,21 +6902,25 @@ async function leaveRoom() {
         deckType: "system",
         deck: "Info Game",
         title: `${leavingPlayer?.name || "Pemain"} Keluar`,
-        text: `Permainan tetap berlanjut dengan ${remainingParticipants.length} pemain.`,
+        text: `Permainan tetap berlanjut dengan ${remainingParticipants.length} pemain.${assetSettlementText ? ` ${assetSettlementText}` : ""}`,
         seat: mySeat,
         playerName: leavingPlayer?.name || "Pemain"
       };
     }
   }
 
-  await stopVoiceChatNetwork();
-  await detachCurrentPresence({ cancelDisconnect: true });
-  await roomRef.update(updates);
-
   const leaveLog = latest?.status === "lobby" && newHostName
     ? `${leavingPlayer?.name || "Pemain"} keluar dari room. ${newHostName} menjadi host baru.`
     : `${leavingPlayer?.name || "Pemain"} keluar dari game.`;
-  await addRemoteLog(leaveLog);
+  const leaveLogTimestamp = Date.now();
+  updates[`logs/${leaveLogTimestamp}`] = leaveLog;
+  if (assetSettlementText) {
+    updates[`logs/${leaveLogTimestamp + 1}`] = assetSettlementText;
+  }
+
+  await stopVoiceChatNetwork();
+  await detachCurrentPresence({ cancelDisconnect: true });
+  await roomRef.update(updates);
 
   resetLocalAnimationTimeline();
   clearRouletteSpinSound();
