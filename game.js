@@ -21,6 +21,7 @@ const PLAYER_PAYMENT_TOAST_MS = 5000;
 // Lobby dan directory room. Engine permainan tidak bergantung pada konstanta ini.
 const PLAYER_PROFILE_KEY = "atho_player_profile_name";
 const ROOM_DIRECTORY_HEARTBEAT_MS = 15000;
+const FINISHED_ROOM_DELETE_DELAY_MS = 1800;
 const ROOM_VISIBILITIES = new Set(["public", "private", "unlisted"]);
 
 const PROPERTY_DATA = {
@@ -287,6 +288,11 @@ let localNetworkTimeoutTimer = null;
 let firebaseConnected = false;
 let membershipResetInProgress = false;
 let manualLeaveInProgress = false;
+let normalRouletteInProgress = false;
+let finishedRoomCleanupTimer = null;
+let finishedRoomCleanupInProgress = false;
+let finishedRoomCleanupCode = "";
+let finishedRoomResultMessage = "";
 let playerPaymentToastTimer = null;
 let playerPaymentToastId = "";
 let rouletteSoundTimers = [];
@@ -885,6 +891,99 @@ function scheduleRoomListingSync(_stateLike = roomState, { force = false } = {})
   }, force ? 0 : 120);
 }
 
+function getFinishedRoomCleanupSeat(stateLike = roomState) {
+  if (!stateLike?.players) return null;
+
+  const winnerSeat = Number(stateLike.winnerSeat);
+  const winner = stateLike.players?.[winnerSeat];
+  if (Number.isInteger(winnerSeat) && winner?.id && winner?.authUid) {
+    return winnerSeat;
+  }
+
+  const connectedMembers = Object.values(stateLike.players)
+    .filter(player => player?.id && player?.authUid && isPlayerConnectedInState(stateLike, player))
+    .sort((a, b) => Number(a.seat) - Number(b.seat));
+  if (connectedMembers.length) return Number(connectedMembers[0].seat);
+
+  const remainingMembers = Object.values(stateLike.players)
+    .filter(player => player?.id && player?.authUid)
+    .sort((a, b) => Number(a.seat) - Number(b.seat));
+  return remainingMembers.length ? Number(remainingMembers[0].seat) : null;
+}
+
+async function deleteFinishedRoom(code) {
+  const normalizedCode = normalizeRoomCode(code);
+  if (!db || !normalizedCode || finishedRoomCleanupInProgress) return;
+  finishedRoomCleanupInProgress = true;
+
+  try {
+    const roomSnapshot = await db.ref(`rooms/${normalizedCode}`).once("value");
+    const latest = roomSnapshot.val();
+    if (!latest || latest.status !== "finished") return;
+
+    const cleanupSeat = getFinishedRoomCleanupSeat(latest);
+    const member = latest.players?.[mySeat];
+    if (Number(cleanupSeat) !== Number(mySeat)
+      || member?.authUid !== currentAuthUid
+      || !member?.id) {
+      return;
+    }
+
+    // Bersihkan indeks dan data pendukung selagi room finished masih tersedia
+    // untuk validasi rules. State utama dihapus pada operasi berikutnya.
+    await db.ref().update({
+      [`roomDirectory/${normalizedCode}`]: null,
+      [`roomLookup/${normalizedCode}`]: null,
+      [`voiceSignals/${normalizedCode}`]: null,
+      [`roomAccess/${normalizedCode}`]: null,
+      [`roomSecrets/${normalizedCode}`]: null
+    });
+    await db.ref(`rooms/${normalizedCode}`).remove();
+  } catch (error) {
+    console.warn("Room selesai belum dapat dihapus otomatis.", error);
+  } finally {
+    finishedRoomCleanupInProgress = false;
+  }
+}
+
+function scheduleFinishedRoomDeletion(stateLike = roomState) {
+  if (stateLike?.status !== "finished" || !roomCode) {
+    if (finishedRoomCleanupTimer) clearTimeout(finishedRoomCleanupTimer);
+    finishedRoomCleanupTimer = null;
+    return;
+  }
+
+  const winnerSeat = Number(stateLike.winnerSeat);
+  const winnerName = Number.isInteger(winnerSeat)
+    ? (stateLike.players?.[winnerSeat]?.name || "Pemain terakhir")
+    : "";
+  finishedRoomCleanupCode = roomCode;
+  finishedRoomResultMessage = winnerName
+    ? `Game selesai. ${winnerName} menang. Room telah dihapus.`
+    : "Game selesai. Room telah dihapus.";
+
+  const cleanupSeat = getFinishedRoomCleanupSeat(stateLike);
+  if (Number(cleanupSeat) !== Number(mySeat) || finishedRoomCleanupTimer || finishedRoomCleanupInProgress) {
+    return;
+  }
+
+  // Room hilang dari Room List segera. State utama dipertahankan sebentar agar
+  // seluruh client sempat menerima dan menampilkan hasil pemenang.
+  db.ref().update({
+    [`roomDirectory/${roomCode}`]: null,
+    [`roomLookup/${roomCode}`]: null
+  }).catch(error => {
+    console.warn("Room selesai belum dapat disembunyikan dari daftar.", error);
+  });
+
+  finishedRoomCleanupTimer = setTimeout(() => {
+    finishedRoomCleanupTimer = null;
+    deleteFinishedRoom(finishedRoomCleanupCode).catch(error => {
+      console.warn("Gagal menjalankan cleanup room selesai.", error);
+    });
+  }, FINISHED_ROOM_DELETE_DELAY_MS);
+}
+
 async function readRoomLookup(code) {
   const normalizedCode = normalizeRoomCode(code);
   if (!normalizedCode) return null;
@@ -1026,6 +1125,10 @@ async function returnToSetupView(message = "") {
     if (disconnectCountdownTimer) clearInterval(disconnectCountdownTimer);
     disconnectExpiryTimer = null;
     disconnectCountdownTimer = null;
+    normalRouletteInProgress = false;
+    if (finishedRoomCleanupTimer) clearTimeout(finishedRoomCleanupTimer);
+    finishedRoomCleanupTimer = null;
+    finishedRoomCleanupInProgress = false;
 
     await detachCurrentPresence({ cancelDisconnect: firebaseConnected });
     roomRef?.off();
@@ -1054,6 +1157,8 @@ async function returnToSetupView(message = "") {
   els.disconnectOverlay?.classList.add("hidden");
   showLobbyHome();
 
+  finishedRoomCleanupCode = "";
+  finishedRoomResultMessage = "";
   membershipResetInProgress = false;
   if (message) setTimeout(() => alert(message), 80);
 }
@@ -1967,8 +2072,24 @@ function subscribeRoom() {
   roomRef.on("value", (snap) => {
     roomState = snap.val();
     if (!roomState) {
-      returnToSetupView("Room sudah tidak tersedia.");
+      const finishedMessage = finishedRoomCleanupCode === roomCode
+        ? finishedRoomResultMessage
+        : "";
+      returnToSetupView(finishedMessage || "Room sudah tidak tersedia.");
       return;
+    }
+
+    if (normalRouletteInProgress) {
+      const localPlayer = roomState.players?.[mySeat];
+      if (roomState.isRolling
+        || roomState.status !== "playing"
+        || Number(roomState.currentSeat) !== Number(mySeat)
+        || roomState.pendingAction
+        || roomState.debtState
+        || localPlayer?.inJail
+        || localPlayer?.bankrupt) {
+        normalRouletteInProgress = false;
+      }
     }
 
     if (!isCurrentMembershipValid(roomState)) {
@@ -1989,7 +2110,11 @@ function subscribeRoom() {
         console.warn("Gagal membersihkan penanda room kosong.", error);
       });
     }
-    scheduleRoomListingSync(roomState);
+    if (roomState.status === "finished") {
+      scheduleFinishedRoomDeletion(roomState);
+    } else {
+      scheduleRoomListingSync(roomState);
+    }
 
     if (!roomState.propertyState) {
       roomRef.child("propertyState").set(makeInitialPropertyState());
@@ -2155,6 +2280,7 @@ function canIRoll() {
     roomState.status === "playing" &&
     Number(roomState.currentSeat) === Number(mySeat) &&
     !roomState.isRolling &&
+    !normalRouletteInProgress &&
     !roomState.pendingAction &&
     !roomState.debtState &&
     !isGamePausedForDisconnect(roomState) &&
@@ -2623,7 +2749,6 @@ async function finalizeActiveMovePresentation(moveId, seat) {
   }
 
   if (latestPlayer?.bankrupt) {
-    await roomRef.update({ isRolling: false });
     await finishTurn();
     return;
   }
@@ -2633,7 +2758,8 @@ async function finalizeActiveMovePresentation(moveId, seat) {
     return;
   }
 
-  await roomRef.update({ isRolling: false });
+  // finishTurn memindahkan currentSeat dan membuka isRolling dalam satu update.
+  // Jangan membuka lock lebih dulu karena tombol roulette dapat aktif sesaat.
   await finishTurn();
 }
 
@@ -2751,8 +2877,12 @@ async function acceptRoulette12Bonus(event) {
 }
 
 async function rollDice() {
-  if (!canIRoll()) return;
+  if (!canIRoll() || normalRouletteInProgress) return;
 
+  normalRouletteInProgress = true;
+  if (els.rollBtn) els.rollBtn.disabled = true;
+
+  try {
   const player = roomState.players[mySeat];
   const result = Math.floor(Math.random() * 12) + 1;
   const currentStreak = Number(player.roulette12Streak || 0);
@@ -2924,6 +3054,11 @@ async function rollDice() {
     isRolling: true,
     lastMove: updates.lastMove
   });
+  } catch (error) {
+    normalRouletteInProgress = false;
+    if (roomState) renderUI();
+    throw error;
+  }
 }
 
 
@@ -7843,6 +7978,10 @@ async function leaveRoom() {
   if (disconnectCountdownTimer) clearInterval(disconnectCountdownTimer);
   disconnectExpiryTimer = null;
   disconnectCountdownTimer = null;
+  normalRouletteInProgress = false;
+  if (finishedRoomCleanupTimer) clearTimeout(finishedRoomCleanupTimer);
+  finishedRoomCleanupTimer = null;
+  finishedRoomCleanupInProgress = false;
   roomRef.off();
   roomRef = null;
   roomState = null;
