@@ -286,6 +286,7 @@ let disconnectCleanupInProgress = false;
 let localNetworkTimeoutTimer = null;
 let firebaseConnected = false;
 let membershipResetInProgress = false;
+let manualLeaveInProgress = false;
 let playerPaymentToastTimer = null;
 let playerPaymentToastId = "";
 let rouletteSoundTimers = [];
@@ -820,7 +821,27 @@ function buildRoomListing(stateLike, code = roomCode) {
 
 async function syncRoomListingNow(stateLike = roomState, { force = false } = {}) {
   if (!db || !roomRef || !roomCode || !stateLike || mySeat === null) return;
-  const listing = buildRoomListing(stateLike, roomCode);
+
+  const activeRoomRef = roomRef;
+  const activeRoomCode = roomCode;
+  const activeSeat = Number(mySeat);
+  const activePlayerId = myPlayerId;
+  const activeAuthUid = currentAuthUid;
+
+  // Gunakan snapshot room terbaru sebagai sumber angka directory. Ini mencegah
+  // timer lama menulis kembali jumlah pemain sebelum seseorang keluar.
+  const authoritativeSnapshot = await activeRoomRef.once("value");
+  if (roomRef !== activeRoomRef
+    || roomCode !== activeRoomCode
+    || Number(mySeat) !== activeSeat) return;
+
+  const authoritativeState = authoritativeSnapshot.val();
+  const activeMembership = authoritativeState?.players?.[activeSeat];
+  if (!authoritativeState
+    || activeMembership?.id !== activePlayerId
+    || activeMembership?.authUid !== activeAuthUid) return;
+
+  const listing = buildRoomListing(authoritativeState, activeRoomCode);
   const signature = JSON.stringify({
     roomName: listing.roomName,
     visibility: listing.visibility,
@@ -838,21 +859,27 @@ async function syncRoomListingNow(stateLike = roomState, { force = false } = {})
 
   const updates = {};
   Object.entries(listing).forEach(([key, value]) => {
-    updates[`roomLookup/${roomCode}/${key}`] = value;
+    updates[`roomLookup/${activeRoomCode}/${key}`] = value;
   });
   if (listing.visibility === "unlisted") {
-    updates[`roomDirectory/${roomCode}`] = null;
+    updates[`roomDirectory/${activeRoomCode}`] = null;
   } else {
-    updates[`roomDirectory/${roomCode}`] = listing;
+    updates[`roomDirectory/${activeRoomCode}`] = listing;
   }
   await db.ref().update(updates);
 }
 
-function scheduleRoomListingSync(stateLike = roomState, { force = false } = {}) {
+function scheduleRoomListingSync(_stateLike = roomState, { force = false } = {}) {
   if (roomDirectorySyncTimer) clearTimeout(roomDirectorySyncTimer);
+  const scheduledRoomRef = roomRef;
+  const scheduledRoomCode = roomCode;
   roomDirectorySyncTimer = setTimeout(() => {
     roomDirectorySyncTimer = null;
-    syncRoomListingNow(stateLike, { force }).catch(error => {
+    if (!roomRef
+      || roomRef !== scheduledRoomRef
+      || roomCode !== scheduledRoomCode
+      || mySeat === null) return;
+    syncRoomListingNow(roomState, { force }).catch(error => {
       console.warn("Metadata Room List gagal diperbarui.", error);
     });
   }, force ? 0 : 120);
@@ -1172,6 +1199,8 @@ function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 3
   leavingPlayer.isHost = false;
   leavingPlayer.roulette12Streak = 0;
   leavingPlayer.disconnectedAt = Date.now();
+  leavingPlayer.leftAt = Date.now();
+  leavingPlayer.leftReason = "disconnect-timeout";
   if (room.presence) room.presence[seat] = null;
   room.turnOrder = normalizeSeatArray(room.turnOrder).filter(value => Number(value) !== Number(seat));
 
@@ -1777,7 +1806,9 @@ async function claimRoomSeatAtomically(seat, playerName, { allowEmpty = true } =
       authUid: currentAuthUid,
       name: playerName,
       connected: true,
-      disconnectedAt: null
+      disconnectedAt: null,
+      leftAt: null,
+      leftReason: ""
     };
 
     if (!sameMembership) {
@@ -1941,6 +1972,9 @@ function subscribeRoom() {
     }
 
     if (!isCurrentMembershipValid(roomState)) {
+      // Saat tombol Keluar diproses, Firebase memancarkan snapshot lokal lebih
+      // dulu. Jangan jalankan cleanup kedua sebelum update leave selesai.
+      if (manualLeaveInProgress) return;
       returnToSetupView("Koneksi melewati batas 30 detik atau kamu sudah keluar dari room. Silakan buat atau join room kembali.");
       return;
     }
@@ -5743,6 +5777,7 @@ function getVisiblePlayerSortKey(player) {
   const seat = Number(player.seat);
   if (isSpectator(player)) return 100 + seat;
   if (player?.bankrupt) return 50 + seat;
+  if (player?.leftAt) return 75 + seat;
 
   if (["playing", "finished"].includes(roomState?.status) && shouldApplyTurnOrderLocally()) {
     const order = getTurnOrderFromState(roomState);
@@ -5792,7 +5827,7 @@ function animatePlayerListReorder(previousRects) {
 
 function renderPlayersList(players) {
   const visiblePlayers = Object.values(players)
-    .filter(player => player?.id || player.bankrupt || isPlayerConnectedInState(roomState, player))
+    .filter(player => player?.id || player.bankrupt || player?.leftAt || isPlayerConnectedInState(roomState, player))
     .sort((a, b) => getVisiblePlayerSortKey(a) - getVisiblePlayerSortKey(b));
   const visibleSeats = new Set(visiblePlayers.map(player => Number(player.seat)));
   const previousRects = new Map();
@@ -5828,9 +5863,10 @@ function renderPlayersList(players) {
     }).join("");
 
     const playerConnected = isPlayerConnectedInState(roomState, player);
-    row.classList.toggle("active", !spectator && seat === Number(roomState.currentSeat) && !player.bankrupt);
+    const playerLeft = Boolean(player?.leftAt) && !player?.id && !playerConnected;
+    row.classList.toggle("active", !playerLeft && !spectator && seat === Number(roomState.currentSeat) && !player.bankrupt);
     row.classList.toggle("bankrupt", Boolean(player.bankrupt));
-    row.classList.toggle("disconnected", !playerConnected && !player.bankrupt);
+    row.classList.toggle("disconnected", (playerLeft || !playerConnected) && !player.bankrupt);
     row.classList.toggle("spectator", spectator);
 
     const dot = row.querySelector('[data-role="dot"]');
@@ -5842,11 +5878,23 @@ function renderPlayersList(players) {
 
     dot.style.background = player.color || (spectator ? "#607d8b" : PLAYER_COLORS[seat]);
     dot.textContent = getPlayerDisplayNumber(player);
-    name.textContent = player.bankrupt
-      ? `${player.name} • BANGKRUT`
-      : spectator ? `${player.name} • PENONTON` : player.name;
+    name.textContent = playerLeft
+      ? `${player.name} • KELUAR`
+      : player.bankrupt
+        ? `${player.name} • BANGKRUT`
+        : spectator ? `${player.name} • PENONTON` : player.name;
 
-    if (spectator) {
+    if (playerLeft) {
+      const leftText = player.leftReason === "disconnect-timeout"
+        ? "Koneksi tidak kembali dalam 30 detik"
+        : "Keluar dari permainan";
+      sub.textContent = leftText;
+      owned.innerHTML = '<span class="owned-tag bankrupt-tag">TIDAK LAGI BERMAIN</span>';
+      playerMoneyAnimationStates.delete(seat);
+      money.textContent = "KELUAR";
+      moneyChange.textContent = "";
+      money.classList.remove("money-value-pop");
+    } else if (spectator) {
       sub.textContent = playerConnected ? "Online • Menyaksikan permainan" : "Offline • Penonton";
       owned.innerHTML = '<span class="owned-tag spectator-tag">Tidak masuk giliran</span>';
       playerMoneyAnimationStates.delete(seat);
@@ -7577,6 +7625,11 @@ async function leaveRoom() {
   const confirmed = confirm("Yakin ingin keluar dari game?");
   if (!confirmed) return;
 
+  // Batalkan penulisan Room List yang mungkin masih membawa snapshot sebelum
+  // pemain keluar. Tanpa ini, timer lama dapat menimpa hitungan terbaru.
+  if (roomDirectorySyncTimer) clearTimeout(roomDirectorySyncTimer);
+  roomDirectorySyncTimer = null;
+
   const latest = (await roomRef.once("value")).val();
   const leavingPlayer = latest?.players?.[mySeat];
   const updates = {};
@@ -7588,13 +7641,21 @@ async function leaveRoom() {
     : null;
   const assetSettlementText = describeLeavingAssetSettlement(assetSettlement);
 
+  // Tahap pertama mempertahankan id/authUid sampai seluruh perubahan game,
+  // presence, dan Room List berhasil disimpan. Rules room yang ada memang
+  // mensyaratkan anggota penulis tetap tercatat pada newData selama update.
+  // Seat baru dilepas pada tahap kedua melalui path pemainnya sendiri.
   updates[`players/${mySeat}/connected`] = false;
-  updates[`players/${mySeat}/id`] = "";
-  updates[`players/${mySeat}/authUid`] = "";
   updates[`players/${mySeat}/inGame`] = false;
   updates[`players/${mySeat}/isHost`] = false;
   updates[`players/${mySeat}/disconnectedAt`] = firebase.database.ServerValue.TIMESTAMP;
   updates[`players/${mySeat}/roulette12Streak`] = 0;
+  const preserveExitRecord = ["orderRoll", "playing", "finished"].includes(latest?.status)
+    && isMonopolyPlayer(leavingPlayer);
+  updates[`players/${mySeat}/leftAt`] = preserveExitRecord
+    ? firebase.database.ServerValue.TIMESTAMP
+    : null;
+  updates[`players/${mySeat}/leftReason`] = preserveExitRecord ? "manual" : "";
   updates[`presence/${mySeat}`] = null;
   if (normalizeSeatArray(latest?.turnOrder).includes(Number(mySeat))) {
     updates.turnOrder = normalizeSeatArray(latest.turnOrder).filter(seat => seat !== Number(mySeat));
@@ -7712,7 +7773,7 @@ async function leaveRoom() {
         deck: "Info Game",
         title: `${leavingPlayer?.name || "Pemain"} Keluar`,
         text: `Permainan tetap berlanjut dengan ${remainingParticipants.length} pemain.${assetSettlementText ? ` ${assetSettlementText}` : ""}`,
-        seat: mySeat,
+        seat: remainingParticipants[0] ?? null,
         playerName: leavingPlayer?.name || "Pemain"
       };
     }
@@ -7765,8 +7826,16 @@ async function leaveRoom() {
     : listingAfterLeave;
 
   await stopVoiceChatNetwork();
-  await detachCurrentPresence({ cancelDisconnect: true });
+
+  // Simpan state permainan + metadata directory lebih dulu ketika authUid
+  // pemain masih menjadi anggota sah room. Setelah commit berhasil, lepaskan
+  // seat dalam operasi terpisah agar update tidak ditolak Firebase Rules.
   await db.ref().update(rootUpdates);
+  await roomRef.child(`players/${mySeat}`).update({
+    id: "",
+    authUid: ""
+  });
+  await detachCurrentPresence({ cancelDisconnect: true });
 
   resetLocalAnimationTimeline();
   clearRouletteSpinSound();
@@ -7885,7 +7954,17 @@ window.chooseSelectedFreeMoveTarget = chooseSelectedFreeMoveTarget;
 window.sellSelectedPropertyForDebt = sellSelectedPropertyForDebt;
 els.rollBtn.addEventListener("click", rollDice);
 els.copyRoomBtn.addEventListener("click", copyRoomCode);
-els.leaveBtn.addEventListener("click", leaveRoom);
+els.leaveBtn.addEventListener("click", () => {
+  if (manualLeaveInProgress) return;
+  manualLeaveInProgress = true;
+  els.leaveBtn.disabled = true;
+  leaveRoom()
+    .catch(error => handleFirebaseClientError(error, "keluar dari room"))
+    .finally(() => {
+      manualLeaveInProgress = false;
+      if (roomRef) els.leaveBtn.disabled = false;
+    });
+});
 els.disconnectLeaveBtn?.addEventListener("click", handleDisconnectLeave);
 els.historyFab?.addEventListener("click", openHistoryModal);
 els.historyCloseBtn?.addEventListener("click", closeHistoryModal);
