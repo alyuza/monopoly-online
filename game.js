@@ -22,6 +22,10 @@ const PLAYER_PAYMENT_TOAST_MS = 5000;
 const PLAYER_PROFILE_KEY = "atho_player_profile_name";
 const ROOM_DIRECTORY_HEARTBEAT_MS = 15000;
 const FINISHED_ROOM_DELETE_DELAY_MS = 1800;
+// Versi gratis: browser yang sedang membuka lobby membantu membersihkan room
+// yang seluruh presence-nya kosong selama minimal 30 detik.
+const EMPTY_ROOM_CLIENT_CLEANUP_GRACE_MS = 30000;
+const EMPTY_ROOM_CLIENT_CLEANUP_RETRY_MS = 15000;
 const ROOM_VISIBILITIES = new Set(["public", "private", "unlisted"]);
 
 const PROPERTY_DATA = {
@@ -309,6 +313,13 @@ let lastRoomDirectorySyncAt = 0;
 let pendingJoinContext = null;
 let lobbyActionInProgress = false;
 let roomEmptySinceRef = null;
+let roomCleanupCandidateRef = null;
+let activeRoomCleanupCandidateHandler = null;
+let roomCleanupCandidatesRef = null;
+let roomCleanupCandidatesHandler = null;
+let latestRoomCleanupCandidates = {};
+const roomCleanupCandidateTimers = new Map();
+const roomCleanupAttemptsInProgress = new Set();
 
 // Voice chat WebRTC: Firebase hanya dipakai sebagai signaling.
 const VOICE_SIGNAL_MAX_AGE_MS = 60_000;
@@ -554,6 +565,7 @@ function closeAllLobbyModals() {
 
 function showProfileSetup() {
   stopRoomDirectorySubscription();
+  stopRoomCleanupCandidateSubscription();
   closeAllLobbyModals();
   els.profileSetupView?.classList.remove("hidden");
   els.lobbyHomeView?.classList.add("hidden");
@@ -572,6 +584,7 @@ function showLobbyHome() {
   els.lobbyHomeView?.classList.remove("hidden");
   if (els.lobbyPlayerName) els.lobbyPlayerName.textContent = profileName;
   startRoomDirectorySubscription();
+  startRoomCleanupCandidateSubscription();
 }
 
 function initializeLobbyFlow() {
@@ -775,6 +788,127 @@ function stopRoomDirectorySubscription() {
   roomDirectoryHandler = null;
 }
 
+function normalizeRoomCleanupCandidate(code, value) {
+  const candidate = value && typeof value === "object" ? value : {};
+  const normalizedCode = normalizeRoomCode(candidate.roomCode || code);
+  const candidateAt = Number(candidate.candidateAt || 0);
+  if (!normalizedCode || !Number.isFinite(candidateAt) || candidateAt <= 0) return null;
+  return { roomCode: normalizedCode, candidateAt };
+}
+
+function clearRoomCleanupCandidateTimer(code) {
+  const normalizedCode = normalizeRoomCode(code);
+  const timer = roomCleanupCandidateTimers.get(normalizedCode);
+  if (timer) clearTimeout(timer);
+  roomCleanupCandidateTimers.delete(normalizedCode);
+}
+
+function scheduleRoomCleanupCandidate(candidate) {
+  if (!candidate?.roomCode || !candidate?.candidateAt) return;
+  clearRoomCleanupCandidateTimer(candidate.roomCode);
+  const dueAt = Number(candidate.candidateAt) + EMPTY_ROOM_CLIENT_CLEANUP_GRACE_MS;
+  const delay = Math.max(50, dueAt - Date.now());
+  const timer = setTimeout(() => {
+    roomCleanupCandidateTimers.delete(candidate.roomCode);
+    attemptClientAssistedRoomCleanup(candidate.roomCode, candidate.candidateAt).catch(error => {
+      console.warn("Cleanup room kosong gagal dijalankan.", error);
+    });
+  }, delay);
+  roomCleanupCandidateTimers.set(candidate.roomCode, timer);
+}
+
+function reconcileRoomCleanupCandidateTimers() {
+  const activeCodes = new Set();
+  Object.entries(latestRoomCleanupCandidates || {}).forEach(([code, value]) => {
+    const candidate = normalizeRoomCleanupCandidate(code, value);
+    if (!candidate) return;
+    activeCodes.add(candidate.roomCode);
+    scheduleRoomCleanupCandidate(candidate);
+  });
+
+  Array.from(roomCleanupCandidateTimers.keys()).forEach(code => {
+    if (!activeCodes.has(code)) clearRoomCleanupCandidateTimer(code);
+  });
+}
+
+async function attemptClientAssistedRoomCleanup(code, expectedCandidateAt) {
+  const normalizedCode = normalizeRoomCode(code);
+  if (!db || !normalizedCode || roomCleanupAttemptsInProgress.has(normalizedCode)) return;
+  roomCleanupAttemptsInProgress.add(normalizedCode);
+
+  try {
+    const candidateSnapshot = await db.ref(`roomCleanupCandidates/${normalizedCode}`).once("value");
+    const candidate = normalizeRoomCleanupCandidate(normalizedCode, candidateSnapshot.val());
+    if (!candidate) return;
+
+    // Marker yang lebih baru berarti ada disconnect baru; gunakan waktu terbaru.
+    if (Number(candidate.candidateAt) !== Number(expectedCandidateAt)) {
+      scheduleRoomCleanupCandidate(candidate);
+      return;
+    }
+
+    const remainingMs = candidate.candidateAt + EMPTY_ROOM_CLIENT_CLEANUP_GRACE_MS - Date.now();
+    if (remainingMs > 0) {
+      scheduleRoomCleanupCandidate(candidate);
+      return;
+    }
+
+    // Security Rules menjadi pengaman terakhir: penghapusan hanya diizinkan
+    // bila marker sudah >=30 detik dan node presence benar-benar kosong.
+    await db.ref().update({
+      [`rooms/${normalizedCode}`]: null,
+      [`roomDirectory/${normalizedCode}`]: null,
+      [`roomLookup/${normalizedCode}`]: null,
+      [`roomSecrets/${normalizedCode}`]: null,
+      [`roomAccess/${normalizedCode}`]: null,
+      [`voiceSignals/${normalizedCode}`]: null,
+      [`roomCleanupCandidates/${normalizedCode}`]: null
+    });
+  } catch (error) {
+    const codeText = String(error?.code || error?.message || "").toUpperCase();
+    // PERMISSION_DENIED normal terjadi bila seorang pemain sudah reconnect atau
+    // masih ada presence aktif. Marker aktif akan dibersihkan client room.
+    if (!codeText.includes("PERMISSION_DENIED")) throw error;
+
+    const latestSnapshot = await db.ref(`roomCleanupCandidates/${normalizedCode}`).once("value");
+    const latestCandidate = normalizeRoomCleanupCandidate(normalizedCode, latestSnapshot.val());
+    if (latestCandidate) {
+      const retryTimer = setTimeout(() => {
+        roomCleanupCandidateTimers.delete(normalizedCode);
+        attemptClientAssistedRoomCleanup(normalizedCode, latestCandidate.candidateAt).catch(retryError => {
+          console.warn("Percobaan ulang cleanup room kosong gagal.", retryError);
+        });
+      }, EMPTY_ROOM_CLIENT_CLEANUP_RETRY_MS);
+      clearRoomCleanupCandidateTimer(normalizedCode);
+      roomCleanupCandidateTimers.set(normalizedCode, retryTimer);
+    }
+  } finally {
+    roomCleanupAttemptsInProgress.delete(normalizedCode);
+  }
+}
+
+function startRoomCleanupCandidateSubscription() {
+  if (!db || roomCleanupCandidatesHandler || els.lobbyHomeView?.classList.contains("hidden")) return;
+  roomCleanupCandidatesRef = db.ref("roomCleanupCandidates");
+  roomCleanupCandidatesHandler = snapshot => {
+    latestRoomCleanupCandidates = snapshot.val() || {};
+    reconcileRoomCleanupCandidateTimers();
+  };
+  roomCleanupCandidatesRef.on("value", roomCleanupCandidatesHandler, error => {
+    console.warn("Marker cleanup room tidak dapat dibaca.", error);
+  });
+}
+
+function stopRoomCleanupCandidateSubscription() {
+  if (roomCleanupCandidatesRef && roomCleanupCandidatesHandler) {
+    roomCleanupCandidatesRef.off("value", roomCleanupCandidatesHandler);
+  }
+  roomCleanupCandidatesRef = null;
+  roomCleanupCandidatesHandler = null;
+  latestRoomCleanupCandidates = {};
+  Array.from(roomCleanupCandidateTimers.keys()).forEach(clearRoomCleanupCandidateTimer);
+}
+
 async function refreshRoomDirectory() {
   if (!db) return;
   els.refreshRoomListBtn.disabled = true;
@@ -936,7 +1070,8 @@ async function deleteFinishedRoom(code) {
       [`roomLookup/${normalizedCode}`]: null,
       [`voiceSignals/${normalizedCode}`]: null,
       [`roomAccess/${normalizedCode}`]: null,
-      [`roomSecrets/${normalizedCode}`]: null
+      [`roomSecrets/${normalizedCode}`]: null,
+      [`roomCleanupCandidates/${normalizedCode}`]: null
     });
     await db.ref(`rooms/${normalizedCode}`).remove();
   } catch (error) {
@@ -1526,9 +1661,13 @@ async function configureCurrentPresence() {
     connected: false,
     disconnectedAt: serverTimestamp
   });
-  // emptySince hanya ditandai oleh leave terakhir atau cleanup server setelah
-  // memastikan seluruh presence benar-benar kosong. Jangan menandainya dari
-  // onDisconnect satu client karena anggota lain mungkin masih berada di room.
+  // Marker ini bukan keputusan bahwa room sudah kosong. Setiap disconnect boleh
+  // membuat marker, tetapi penghapusan baru diizinkan setelah 30 detik DAN
+  // Security Rules memastikan seluruh presence room benar-benar kosong.
+  await roomCleanupCandidateRef?.onDisconnect().set({
+    roomCode,
+    candidateAt: serverTimestamp
+  });
 
   await playerPresenceRef.set({
     playerId: myPlayerId,
@@ -1544,11 +1683,17 @@ async function configureCurrentPresence() {
   if (roomEmptySinceRef) {
     await roomEmptySinceRef.set(null);
   }
+  if (roomCleanupCandidateRef) {
+    await roomCleanupCandidateRef.remove();
+  }
 }
 
 async function detachCurrentPresence({ cancelDisconnect = true } = {}) {
   if (connectionInfoRef && connectionInfoHandler) {
     connectionInfoRef.off("value", connectionInfoHandler);
+  }
+  if (roomCleanupCandidateRef && activeRoomCleanupCandidateHandler) {
+    roomCleanupCandidateRef.off("value", activeRoomCleanupCandidateHandler);
   }
 
   if (cancelDisconnect) {
@@ -1556,6 +1701,7 @@ async function detachCurrentPresence({ cancelDisconnect = true } = {}) {
       await playerPresenceRef?.onDisconnect().cancel();
       await presencePlayerRef?.onDisconnect().cancel();
       await roomEmptySinceRef?.onDisconnect().cancel();
+      await roomCleanupCandidateRef?.onDisconnect().cancel();
     } catch (error) {
       console.warn("Gagal membatalkan handler onDisconnect.", error);
     }
@@ -1569,6 +1715,8 @@ async function detachCurrentPresence({ cancelDisconnect = true } = {}) {
   playerPresenceRef = null;
   presencePlayerRef = null;
   roomEmptySinceRef = null;
+  roomCleanupCandidateRef = null;
+  activeRoomCleanupCandidateHandler = null;
   presenceConnectionId = "";
 }
 
@@ -1580,7 +1728,19 @@ async function setupCurrentPresence() {
   playerPresenceRef = roomRef.child(`presence/${mySeat}/${presenceConnectionId}`);
   presencePlayerRef = roomRef.child(`players/${mySeat}`);
   roomEmptySinceRef = roomRef.child("emptySince");
+  roomCleanupCandidateRef = db.ref(`roomCleanupCandidates/${roomCode}`);
   connectionInfoRef = db.ref(".info/connected");
+
+  // Selama masih ada satu client aktif di room, marker disconnect apa pun harus
+  // segera dibersihkan. Listener ini juga menutup race ketika marker dibuat
+  // sedikit setelah presence pemain lain berubah.
+  activeRoomCleanupCandidateHandler = snapshot => {
+    if (!snapshot.exists() || !firebaseConnected || !roomCleanupCandidateRef || mySeat === null) return;
+    roomCleanupCandidateRef.remove().catch(error => {
+      console.warn("Gagal membatalkan kandidat cleanup karena room masih aktif.", error);
+    });
+  };
+  roomCleanupCandidateRef.on("value", activeRoomCleanupCandidateHandler);
 
   connectionInfoHandler = (snapshot) => {
     const connected = snapshot.val() === true;
@@ -2047,6 +2207,7 @@ async function joinRoom() {
 
 function enterGameView() {
   stopRoomDirectorySubscription();
+  stopRoomCleanupCandidateSubscription();
   closeAllLobbyModals();
   els.appRoot?.classList.add("game-active");
   resetLocalAnimationTimeline();
@@ -2108,6 +2269,11 @@ function subscribeRoom() {
     if (connectedMembers.length > 0 && roomState.emptySince) {
       roomRef.child("emptySince").set(null).catch(error => {
         console.warn("Gagal membersihkan penanda room kosong.", error);
+      });
+    }
+    if (connectedMembers.length > 0 && roomCleanupCandidateRef) {
+      roomCleanupCandidateRef.remove().catch(error => {
+        console.warn("Gagal membatalkan kandidat cleanup room aktif.", error);
       });
     }
     if (roomState.status === "finished") {
@@ -6920,24 +7086,70 @@ class BoardScene extends Phaser.Scene {
     const canvas = this.game?.canvas;
     if (!canvas || this.mobileTouchEndHandler) return;
 
+    // Phaser pointerup tetap menjadi handler utama. Fallback native ini khusus
+    // perangkat sentuh yang kadang tidak meneruskan pointerup ke objek Phaser.
+    // Sebelumnya fallback hanya aktif saat memilih petak Parkir Bebas, sehingga
+    // tap tanah untuk membuka detail tidak bekerja pada sebagian browser mobile.
+    this.mobileTouchStartHandler = (event) => {
+      const touch = event.touches?.[0];
+      if (!touch || event.touches?.length !== 1) {
+        this.mobileTouchStart = null;
+        return;
+      }
+
+      this.mobileTouchStart = {
+        x: touch.clientX,
+        y: touch.clientY,
+        at: Date.now()
+      };
+    };
+
+    this.mobileTouchCancelHandler = () => {
+      this.mobileTouchStart = null;
+    };
+
     this.mobileTouchEndHandler = (event) => {
-      if (roomState?.pendingAction?.type !== "freeMove") return;
       const touch = event.changedTouches?.[0];
       if (!touch) return;
 
+      const start = this.mobileTouchStart;
+      this.mobileTouchStart = null;
+
+      // Jangan menganggap swipe/scroll sebagai tap petak.
+      if (start) {
+        const distance = Math.hypot(touch.clientX - start.x, touch.clientY - start.y);
+        const duration = Date.now() - Number(start.at || 0);
+        if (distance > 24 || duration > 900) return;
+      }
+
       const tileIndex = this.getTileIndexFromClientPoint(touch.clientX, touch.clientY);
       if (tileIndex === null) return;
+
+      const boardTile = BOARD[tileIndex];
+      const actionType = roomState?.pendingAction?.type;
+      const canHandleTap = actionType === "freeMove" || boardTile?.type === "property";
+      if (!canHandleTap) return;
 
       event.preventDefault();
       event.stopPropagation();
       this.handleTileTap(tileIndex);
     };
 
-    canvas.addEventListener("touchend", this.mobileTouchEndHandler, { passive: false });
+    // Capture dipakai agar fallback tetap menerima touchend walaupun Phaser atau
+    // browser menghentikan bubbling pada canvas. De-dupe di handleTileTap menjaga
+    // agar pointerup Phaser dan touchend native tidak membuka popup dua kali.
+    canvas.addEventListener("touchstart", this.mobileTouchStartHandler, { passive: true, capture: true });
+    canvas.addEventListener("touchcancel", this.mobileTouchCancelHandler, { passive: true, capture: true });
+    canvas.addEventListener("touchend", this.mobileTouchEndHandler, { passive: false, capture: true });
 
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
-      canvas.removeEventListener("touchend", this.mobileTouchEndHandler);
+      canvas.removeEventListener("touchstart", this.mobileTouchStartHandler, true);
+      canvas.removeEventListener("touchcancel", this.mobileTouchCancelHandler, true);
+      canvas.removeEventListener("touchend", this.mobileTouchEndHandler, true);
+      this.mobileTouchStartHandler = null;
+      this.mobileTouchCancelHandler = null;
       this.mobileTouchEndHandler = null;
+      this.mobileTouchStart = null;
     });
   }
 
@@ -7962,15 +8174,47 @@ async function leaveRoom() {
 
   await stopVoiceChatNetwork();
 
-  // Simpan state permainan + metadata directory lebih dulu ketika authUid
-  // pemain masih menjadi anggota sah room. Setelah commit berhasil, lepaskan
-  // seat dalam operasi terpisah agar update tidak ditolak Firebase Rules.
-  await db.ref().update(rootUpdates);
-  await roomRef.child(`players/${mySeat}`).update({
-    id: "",
-    authUid: ""
-  });
-  await detachCurrentPresence({ cancelDisconnect: true });
+  if (roomWillBeEmpty) {
+    // Tidak ada anggota lain yang masih terhubung. Hapus semua node room saat
+    // identitas pemain terakhir masih tercatat agar Firebase Rules dapat
+    // memverifikasi bahwa penghapus memang anggota terakhir yang sah.
+    // onDisconnect dibatalkan lebih dulu supaya callback lama tidak membuat
+    // ulang sebagian node setelah room utama dihapus.
+    await detachCurrentPresence({ cancelDisconnect: true });
+
+    await db.ref().update({
+      [`roomDirectory/${leavingRoomCode}`]: null,
+      [`roomLookup/${leavingRoomCode}`]: null,
+      [`voiceSignals/${leavingRoomCode}`]: null,
+      [`roomAccess/${leavingRoomCode}`]: null,
+      [`roomSecrets/${leavingRoomCode}`]: null,
+      [`roomCleanupCandidates/${leavingRoomCode}`]: null
+    });
+
+    // Lepaskan listener sebelum remove agar client ini tidak menampilkan alert
+    // "Room sudah tidak tersedia" untuk aksi keluar yang memang disengaja.
+    roomRef.off();
+    try {
+      await db.ref(`rooms/${leavingRoomCode}`).remove();
+    } catch (error) {
+      // Jika penghapusan gagal, sambungkan kembali agar pemain tidak kehilangan
+      // state lokal secara diam-diam dan error dapat ditangani caller.
+      roomRef = db.ref(`rooms/${leavingRoomCode}`);
+      await setupCurrentPresence();
+      subscribeRoom();
+      throw error;
+    }
+  } else {
+    // Simpan state permainan + metadata directory lebih dulu ketika authUid
+    // pemain masih menjadi anggota sah room. Setelah commit berhasil, lepaskan
+    // seat dalam operasi terpisah agar update tidak ditolak Firebase Rules.
+    await db.ref().update(rootUpdates);
+    await roomRef.child(`players/${mySeat}`).update({
+      id: "",
+      authUid: ""
+    });
+    await detachCurrentPresence({ cancelDisconnect: true });
+  }
 
   resetLocalAnimationTimeline();
   clearRouletteSpinSound();
