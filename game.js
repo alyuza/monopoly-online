@@ -21,28 +21,44 @@ const PLAYER_PAYMENT_TOAST_MS = 5000;
 // Timer AFK hanya menjadi lapisan otomatisasi di atas handler yang sudah ada.
 // Tidak ada perhitungan roulette, kartu, properti, atau penjara yang diduplikasi.
 const AFK_ACTION_TIMEOUTS_MS = Object.freeze({
-  startingOrder: 25000,
-  roll: 30000,
+  startingOrder: 15000,
+  roll: 15000,
   jail: 20000,
-  buy: 20000,
+  buy: 30000,
   build: 20000,
-  freeParkingChoice: 20000,
-  freeMove: 20000,
-  roulette12Bonus: 12000,
+  freeParkingChoice: 30000,
+  freeMove: 30000,
+  roulette12Bonus: 10000,
   tripleTwelveJail: 10000,
   goJailPopup: 10000,
-  taxExemptionChoice: 18000,
-  cardMove: 12000,
-  cardFreeParking: 12000,
-  cardChoiceFineOrChance: 18000,
-  cardChoiceMoveBack: 18000,
-  cardChooseBuild: 18000,
-  card: 12000,
+  taxExemptionChoice: 15000,
+  cardMove: 10000,
+  cardFreeParking: 10000,
+  cardChoiceFineOrChance: 20000,
+  cardChoiceMoveBack: 25000,
+  cardChooseBuild: 25000,
+  card: 10000,
   taxPopup: 10000,
   debt: 30000
 });
 const AFK_MANUAL_INTERACTION_GRACE_MS = 1500;
 const AFK_RETRY_AFTER_INTERACTION_MS = 3000;
+
+
+function isMobilePortraitViewport() {
+  return typeof window !== "undefined"
+    && typeof window.matchMedia === "function"
+    && window.matchMedia("(orientation: portrait) and (max-width: 700px)").matches;
+}
+
+function getPreferredRenderResolution() {
+  const dpr = Number(typeof window !== "undefined" ? window.devicePixelRatio : 1) || 1;
+  return Math.max(1, Math.min(dpr, isMobilePortraitViewport() ? 2.4 : 2));
+}
+
+function getStaticAfkDisplaySeconds(descriptor) {
+  return Math.max(1, Math.ceil(Number(descriptor?.durationMs || 0) / 1000));
+}
 
 // Lobby dan directory room. Engine permainan tidak bergantung pada konstanta ini.
 const PLAYER_PROFILE_KEY = "atho_player_profile_name";
@@ -337,6 +353,8 @@ let afkActionDeadlineAt = 0;
 let afkActionDescriptor = null;
 let afkAutoActionInProgress = false;
 let lastLocalGameInteractionAt = 0;
+let historyHintShownForRoom = "";
+let historyHintAutoHideTimer = null;
 
 // State lokal lobby. Dipisahkan dari roomState agar tidak mengubah engine permainan.
 let savedPlayerName = "";
@@ -429,6 +447,7 @@ const els = {
   turnTimer: document.getElementById("turnTimer"),
   turnTimerLabel: document.getElementById("turnTimerLabel"),
   turnTimerValue: document.getElementById("turnTimerValue"),
+  turnTimerUnit: document.getElementById("turnTimerUnit"),
   orderAfkTimer: document.getElementById("orderAfkTimer"),
   orderAfkTimerValue: document.getElementById("orderAfkTimerValue"),
   cardAfkTimer: document.getElementById("cardAfkTimer"),
@@ -441,6 +460,8 @@ const els = {
   playersList: document.getElementById("playersList"),
   logList: document.getElementById("logList"),
   historyFab: document.getElementById("historyFab"),
+  historyHint: document.getElementById("historyHint"),
+  historyHintCloseBtn: document.getElementById("historyHintCloseBtn"),
   historyOverlay: document.getElementById("historyOverlay"),
   historyModalList: document.getElementById("historyModalList"),
   historyCloseBtn: document.getElementById("historyCloseBtn"),
@@ -1348,6 +1369,7 @@ async function returnToSetupView(message = "") {
   clearRoomSession();
 
   els.appRoot?.classList.remove("game-active");
+  hideHistoryHint({ remember: false });
   els.setupPanel.classList.remove("hidden");
   els.gamePanel.classList.add("hidden");
   els.roomBadge.textContent = "Belum masuk room";
@@ -4776,6 +4798,8 @@ function renderAfkActionTimer() {
   const visible = Boolean(descriptor && afkActionDeadlineAt > 0);
   const remainingMs = visible ? Math.max(0, afkActionDeadlineAt - Date.now()) : 0;
   const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  const staticSeconds = getStaticAfkDisplaySeconds(descriptor);
+  const compactMobile = visible && isMobilePortraitViewport();
   const actorName = descriptor ? (roomState?.players?.[descriptor.seat]?.name || "Pemain") : "";
   const label = descriptor
     ? (Number(descriptor.seat) === Number(mySeat) ? descriptor.label : `${actorName}: ${descriptor.label}`)
@@ -4784,26 +4808,32 @@ function renderAfkActionTimer() {
 
   if (els.turnTimer) {
     els.turnTimer.classList.toggle("hidden", !visible);
-    els.turnTimer.classList.toggle("urgent", urgent);
+    els.turnTimer.classList.toggle("urgent", urgent && !compactMobile);
+    els.turnTimer.classList.toggle("compact-mobile", compactMobile);
   }
-  if (els.turnTimerLabel) els.turnTimerLabel.textContent = label;
-  if (els.turnTimerValue) els.turnTimerValue.textContent = String(seconds);
+  if (els.turnTimerLabel) els.turnTimerLabel.textContent = compactMobile ? "Otomatis" : label;
+  if (els.turnTimerValue) els.turnTimerValue.textContent = String(compactMobile ? staticSeconds : seconds);
+  if (els.turnTimerUnit) els.turnTimerUnit.textContent = "detik";
 
   const orderVisible = visible && descriptor?.kind === "startingOrder";
   if (els.orderAfkTimer) {
     els.orderAfkTimer.classList.toggle("hidden", !orderVisible);
-    els.orderAfkTimer.classList.toggle("urgent", orderVisible && urgent);
+    els.orderAfkTimer.classList.toggle("urgent", orderVisible && urgent && !compactMobile);
+    els.orderAfkTimer.textContent = compactMobile
+      ? `Otomatis ${staticSeconds} detik`
+      : `Roulette otomatis dalam ${seconds} detik`;
   }
-  if (els.orderAfkTimerValue) els.orderAfkTimerValue.textContent = String(seconds);
 
   const cardVisible = visible
     && Boolean(roomState?.pendingAction)
     && !localPopupOpen;
   if (els.cardAfkTimer) {
     els.cardAfkTimer.classList.toggle("hidden", !cardVisible);
-    els.cardAfkTimer.classList.toggle("urgent", cardVisible && urgent);
+    els.cardAfkTimer.classList.toggle("urgent", cardVisible && urgent && !compactMobile);
+    els.cardAfkTimer.textContent = compactMobile
+      ? `Otomatis ${staticSeconds} detik`
+      : `Aksi otomatis dalam ${seconds} detik`;
   }
-  if (els.cardAfkTimerValue) els.cardAfkTimerValue.textContent = String(seconds);
 }
 
 function clearAfkActionTimer() {
@@ -5104,6 +5134,7 @@ function renderUI() {
   renderPlayerPaymentToast();
   renderDisconnectOverlay();
   renderOrderOverlay();
+  maybeShowHistoryHint();
 }
 
 
@@ -6754,8 +6785,37 @@ function renderLogs() {
   }
 }
 
+function hideHistoryHint({ remember = true } = {}) {
+  if (historyHintAutoHideTimer) clearTimeout(historyHintAutoHideTimer);
+  historyHintAutoHideTimer = null;
+  if (remember && roomCode) historyHintShownForRoom = roomCode;
+  if (!els.historyHint) return;
+  els.historyHint.classList.add("hidden");
+  els.historyHint.setAttribute("aria-hidden", "true");
+}
+
+function maybeShowHistoryHint() {
+  if (!els.historyHint || !roomCode || !roomState) return;
+  if (!isMobilePortraitViewport() || !els.appRoot?.classList.contains("game-active")) {
+    hideHistoryHint({ remember: false });
+    return;
+  }
+  if (roomState.status === "lobby" || roomState.status === "finished") {
+    hideHistoryHint({ remember: false });
+    return;
+  }
+  if (historyHintShownForRoom === roomCode) return;
+
+  historyHintShownForRoom = roomCode;
+  els.historyHint.classList.remove("hidden");
+  els.historyHint.setAttribute("aria-hidden", "false");
+  if (historyHintAutoHideTimer) clearTimeout(historyHintAutoHideTimer);
+  historyHintAutoHideTimer = setTimeout(() => hideHistoryHint(), 10000);
+}
+
 function openHistoryModal() {
   if (!els.historyOverlay) return;
+  hideHistoryHint();
   renderLogs();
   els.historyOverlay.classList.remove("hidden");
   els.historyOverlay.setAttribute("aria-hidden", "false");
@@ -7533,6 +7593,15 @@ function startPhaser() {
     type: Phaser.AUTO,
     parent: "gameCanvas",
     backgroundColor: "#d7f8dd",
+    resolution: getPreferredRenderResolution(),
+    autoRound: false,
+    render: {
+      antialias: true,
+      antialiasGL: true,
+      pixelArt: false,
+      roundPixels: false,
+      powerPreference: "high-performance"
+    },
     scale: {
       mode: Phaser.Scale.RESIZE,
       autoCenter: Phaser.Scale.CENTER_BOTH,
@@ -7926,6 +7995,12 @@ class BoardScene extends Phaser.Scene {
     this.freeMoveHint.setDepth(60);
     this.freeMoveHint.setVisible(false);
 
+    const textResolution = getPreferredRenderResolution();
+    this.children.list.forEach(child => {
+      if (child instanceof Phaser.GameObjects.Text && typeof child.setResolution === "function") {
+        child.setResolution(textResolution);
+      }
+    });
   }
 
   getTileCell(index) {
@@ -8734,6 +8809,7 @@ async function leaveRoom() {
   renderDisconnectOverlay();
 
   els.appRoot?.classList.remove("game-active");
+  hideHistoryHint({ remember: false });
   els.setupPanel.classList.remove("hidden");
   els.gamePanel.classList.add("hidden");
   els.roomBadge.textContent = "Belum masuk room";
@@ -8848,6 +8924,7 @@ els.leaveBtn.addEventListener("click", () => {
 });
 els.disconnectLeaveBtn?.addEventListener("click", handleDisconnectLeave);
 els.historyFab?.addEventListener("click", openHistoryModal);
+els.historyHintCloseBtn?.addEventListener("click", () => hideHistoryHint());
 els.historyCloseBtn?.addEventListener("click", closeHistoryModal);
 els.historyCloseTopBtn?.addEventListener("click", closeHistoryModal);
 els.historyOverlay?.addEventListener("click", (event) => {
@@ -8883,6 +8960,10 @@ document.addEventListener("keydown", unlockMoneyAudio);
 document.addEventListener("pointerdown", unlockVoiceAudioPlayback, { passive: true });
 document.addEventListener("touchstart", unlockVoiceAudioPlayback, { passive: true });
 document.addEventListener("keydown", unlockVoiceAudioPlayback);
+window.addEventListener("resize", () => {
+  renderAfkActionTimer();
+  maybeShowHistoryHint();
+}, { passive: true });
 
 [els.createRoomBtn, els.joinRoomBtn, els.openCreateRoomBtn, els.openJoinCodeBtn, els.refreshRoomListBtn]
   .filter(Boolean)

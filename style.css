@@ -3629,3 +3629,216 @@ body.history-open {
     grid-template-columns: 1fr;
   }
 }
+
+
+/* Mobile HD layout: visual-only overrides. Gameplay logic is untouched. */
+.side-panel-left {
+  display: contents;
+}
+
+/* Preserve the original desktop order after action/player are grouped. */
+.control-card { order: 1; }
+.side-panel-left .action-card { order: 2; }
+.side-panel-left .players-card { order: 3; }
+
+#gameCanvas canvas {
+  display: block;
+  image-rendering: auto;
+  backface-visibility: hidden;
+  transform: translateZ(0);
+}
+
+.history-hint {
+  position: absolute;
+  top: 52px;
+  right: 54px;
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 8px 11px 8px 12px;
+  border: 2px solid var(--navy);
+  border-radius: 13px;
+  background: linear-gradient(180deg, #fffaf0, #f8e4af);
+  color: var(--navy);
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.15;
+  white-space: nowrap;
+  box-shadow: 0 10px 24px rgba(20, 33, 61, .22);
+}
+
+.history-hint.hidden {
+  display: none !important;
+}
+
+.history-hint::before,
+.history-hint::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.history-hint::before {
+  right: -14px;
+  border-left: 14px solid var(--navy);
+  border-top: 10px solid transparent;
+  border-bottom: 10px solid transparent;
+}
+
+.history-hint::after {
+  right: -10px;
+  border-left: 12px solid #f8e4af;
+  border-top: 8px solid transparent;
+  border-bottom: 8px solid transparent;
+}
+
+.history-hint-close {
+  width: 21px;
+  height: 21px;
+  min-width: 21px;
+  min-height: 21px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(20, 33, 61, .12);
+  color: var(--navy);
+  font-size: 15px;
+  font-weight: 1000;
+  line-height: 1;
+}
+
+@media (orientation: portrait) and (max-width: 700px) {
+  .side-panel {
+    grid-template-columns: minmax(0, 1fr) clamp(138px, 39vw, 184px) !important;
+    grid-template-rows: auto !important;
+    grid-template-areas: "left control" !important;
+    gap: 7px !important;
+    padding: 7px !important;
+    align-items: start !important;
+    align-content: start !important;
+  }
+
+  .side-panel-left {
+    grid-area: left;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    min-width: 0;
+    align-self: start;
+  }
+
+  .side-panel-left .action-card,
+  .side-panel-left .players-card {
+    order: initial;
+    width: 100%;
+    min-width: 0;
+    margin: 0 !important;
+    align-self: stretch;
+  }
+
+  .side-panel > .control-card {
+    grid-area: control;
+    order: initial;
+    align-self: start;
+    min-width: 0;
+  }
+
+  .side-panel-left > .panel-card,
+  .control-card {
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    padding: 9px !important;
+    overflow: visible !important;
+  }
+
+  .action-card .action-panel {
+    min-height: 0;
+  }
+
+  .players-list {
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  .history-fab {
+    top: 9px !important;
+    right: 9px !important;
+    width: 38px !important;
+    height: 38px !important;
+    min-width: 38px !important;
+    min-height: 38px !important;
+    border-radius: 999px !important;
+  }
+
+  .history-hint {
+    top: 10px;
+    right: 55px;
+    max-width: min(170px, calc(100vw - 220px));
+    padding: 8px 9px;
+    font-size: 11px;
+  }
+
+  .control-card h2,
+  .control-card .turn-box {
+    padding-right: 40px !important;
+  }
+
+  .turn-timer.compact-mobile {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 4px;
+    min-height: 34px;
+    padding: 7px 8px;
+    text-align: center;
+  }
+
+  .turn-timer.compact-mobile,
+  .turn-timer.compact-mobile span,
+  .turn-timer.compact-mobile strong {
+    font-size: 11px !important;
+    line-height: 1.15;
+  }
+
+  .turn-timer.compact-mobile #turnTimerLabel {
+    font-weight: 900;
+  }
+
+  .control-card .status-text {
+    font-size: 9px !important;
+    line-height: 1.28 !important;
+  }
+
+  /* Avoid browser interpolation that softens the Phaser canvas. */
+  #gameCanvas,
+  #gameCanvas canvas {
+    width: 100% !important;
+    height: 100% !important;
+  }
+}
+
+@media (orientation: portrait) and (max-width: 430px) {
+  .side-panel {
+    grid-template-columns: minmax(0, 1fr) clamp(132px, 40vw, 164px) !important;
+  }
+
+  .history-hint {
+    right: 53px;
+    max-width: 134px;
+  }
+
+  .player-row {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+    padding: 7px;
+  }
+
+  .player-dot {
+    width: 28px;
+    height: 28px;
+  }
+}
