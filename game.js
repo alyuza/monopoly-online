@@ -18,6 +18,32 @@ const DIRECT_PAWN_MOVE_MS = 760;
 const DISCONNECT_GRACE_MS = 30000;
 const PLAYER_PAYMENT_TOAST_MS = 5000;
 
+// Timer AFK hanya menjadi lapisan otomatisasi di atas handler yang sudah ada.
+// Tidak ada perhitungan roulette, kartu, properti, atau penjara yang diduplikasi.
+const AFK_ACTION_TIMEOUTS_MS = Object.freeze({
+  startingOrder: 25000,
+  roll: 30000,
+  jail: 20000,
+  buy: 20000,
+  build: 20000,
+  freeParkingChoice: 20000,
+  freeMove: 20000,
+  roulette12Bonus: 12000,
+  tripleTwelveJail: 10000,
+  goJailPopup: 10000,
+  taxExemptionChoice: 18000,
+  cardMove: 12000,
+  cardFreeParking: 12000,
+  cardChoiceFineOrChance: 18000,
+  cardChoiceMoveBack: 18000,
+  cardChooseBuild: 18000,
+  card: 12000,
+  taxPopup: 10000,
+  debt: 30000
+});
+const AFK_MANUAL_INTERACTION_GRACE_MS = 1500;
+const AFK_RETRY_AFTER_INTERACTION_MS = 3000;
+
 // Lobby dan directory room. Engine permainan tidak bergantung pada konstanta ini.
 const PLAYER_PROFILE_KEY = "atho_player_profile_name";
 const ROOM_DIRECTORY_HEARTBEAT_MS = 15000;
@@ -248,6 +274,9 @@ let auth = null;
 let db = null;
 let currentAuthUid = "";
 let firebaseReadyPromise = null;
+let firebaseServerTimeOffsetMs = 0;
+let firebaseServerTimeOffsetRef = null;
+let firebaseServerTimeOffsetHandler = null;
 let roomRef = null;
 let roomCode = "";
 let mySeat = null;
@@ -301,6 +330,13 @@ let playerPaymentToastTimer = null;
 let playerPaymentToastId = "";
 let rouletteSoundTimers = [];
 let rouletteSoundId = "";
+let afkActionTimeout = null;
+let afkCountdownInterval = null;
+let afkActionSignature = "";
+let afkActionDeadlineAt = 0;
+let afkActionDescriptor = null;
+let afkAutoActionInProgress = false;
+let lastLocalGameInteractionAt = 0;
 
 // State lokal lobby. Dipisahkan dari roomState agar tidak mengubah engine permainan.
 let savedPlayerName = "";
@@ -334,6 +370,7 @@ let localVoiceStream = null;
 let localVoiceMicEnabled = false;
 let voiceInteractionUnlocked = false;
 let voiceToggleInProgress = false;
+let voiceConnectivityCheckTimer = null;
 const voicePeers = new Map();
 const voiceSpeakerMuted = new Map();
 
@@ -389,6 +426,13 @@ const els = {
   rollBtn: document.getElementById("rollBtn"),
   startBtn: document.getElementById("startBtn"),
   turnName: document.getElementById("turnName"),
+  turnTimer: document.getElementById("turnTimer"),
+  turnTimerLabel: document.getElementById("turnTimerLabel"),
+  turnTimerValue: document.getElementById("turnTimerValue"),
+  orderAfkTimer: document.getElementById("orderAfkTimer"),
+  orderAfkTimerValue: document.getElementById("orderAfkTimerValue"),
+  cardAfkTimer: document.getElementById("cardAfkTimer"),
+  cardAfkTimerValue: document.getElementById("cardAfkTimerValue"),
   rouletteWheel: document.getElementById("rouletteWheel"),
   rouletteResult: document.getElementById("rouletteResult"),
   rouletteCaption: document.getElementById("rouletteCaption"),
@@ -453,6 +497,25 @@ async function initFirebase() {
 
   currentAuthUid = user.uid;
   db = firebase.database();
+
+  // Gunakan waktu server Firebase untuk signaling WebRTC. Sebelumnya pesan
+  // offer/answer dapat dianggap kedaluwarsa jika jam dua perangkat berbeda.
+  firebaseServerTimeOffsetRef = db.ref(".info/serverTimeOffset");
+  firebaseServerTimeOffsetHandler = snapshot => {
+    const offset = Number(snapshot.val() || 0);
+    firebaseServerTimeOffsetMs = Number.isFinite(offset) ? offset : 0;
+  };
+  try {
+    const initialOffset = await firebaseServerTimeOffsetRef.once("value");
+    firebaseServerTimeOffsetHandler(initialOffset);
+  } catch (error) {
+    console.warn("Offset waktu server Firebase tidak dapat dibaca.", error);
+  }
+  firebaseServerTimeOffsetRef.on("value", firebaseServerTimeOffsetHandler);
+}
+
+function getFirebaseServerNow() {
+  return Date.now() + Number(firebaseServerTimeOffsetMs || 0);
 }
 
 function randomRoomCode() {
@@ -1256,6 +1319,7 @@ async function returnToSetupView(message = "") {
 
   try {
     await stopVoiceChatNetwork();
+    clearAfkActionTimer();
     if (disconnectExpiryTimer) clearTimeout(disconnectExpiryTimer);
     if (disconnectCountdownTimer) clearInterval(disconnectCountdownTimer);
     disconnectExpiryTimer = null;
@@ -1427,7 +1491,14 @@ function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 3
   const leavingPlayer = room.players[seat];
   const wasParticipant = isPlayerGameParticipant(leavingPlayer, room);
   const originalOrder = getTurnOrderFromState(room);
-  const assetSettlement = room.status === "playing" && wasParticipant
+  const seatsRemovedInBatch = new Set([Number(seat), ...normalizeSeatArray(excludedRecipientSeats)]);
+  const survivingParticipants = originalOrder
+    .filter(value => !seatsRemovedInBatch.has(Number(value)))
+    .filter(value => isPlayerGameParticipant(room.players?.[value], room));
+  const gameEndsAfterRemoval = room.status === "playing"
+    && wasParticipant
+    && survivingParticipants.length <= 1;
+  const assetSettlement = room.status === "playing" && wasParticipant && !gameEndsAfterRemoval
     ? applyLeavingAssetSettlementToRoom(room, seat, excludedRecipientSeats)
     : null;
   const assetSettlementText = describeLeavingAssetSettlement(assetSettlement);
@@ -1488,7 +1559,9 @@ function removeSeatFromRoomState(room, seat, reasonText = "terputus lebih dari 3
         deckType: "system",
         deck: "Game Selesai",
         title: winnerSeat !== null ? `${room.players?.[winnerSeat]?.name || "Pemain terakhir"} Menang!` : "Game Selesai",
-        text: `${leavingPlayer.name || "Seorang pemain"} keluar karena tidak kembali dalam 30 detik.${assetSettlementText ? ` ${assetSettlementText}` : ""}`,
+        text: winnerSeat !== null
+          ? "Semua pemain lain sudah bangkrut atau keluar. Game dinyatakan selesai."
+          : "Tidak ada pemain aktif yang tersisa.",
         seat: winnerSeat,
         playerName: winnerSeat !== null ? room.players?.[winnerSeat]?.name : ""
       };
@@ -2293,6 +2366,7 @@ function subscribeRoom() {
     }
 
     renderUI();
+    syncAfkActionTimer(roomState);
     syncVoicePeers(roomState);
 
     if (gameScene) {
@@ -4565,6 +4639,377 @@ async function finishTurn() {
 }
 
 
+function getAfkTimeoutForKind(kind) {
+  return Number(AFK_ACTION_TIMEOUTS_MS[kind] || 0);
+}
+
+function getAfkPendingActionLabel(actionType) {
+  const labels = {
+    buy: "Tidak membeli otomatis",
+    build: "Melewati pembangunan otomatis",
+    freeParkingChoice: "Memilih bonus Parkir Bebas otomatis",
+    freeMove: "Memilih petak tujuan otomatis",
+    roulette12Bonus: "Roulette bonus otomatis",
+    tripleTwelveJail: "Menutup informasi penjara otomatis",
+    goJailPopup: "Menutup informasi penjara otomatis",
+    taxExemptionChoice: "Menggunakan kartu Bebas Pajak otomatis",
+    cardMove: "Menjalankan perpindahan kartu otomatis",
+    cardFreeParking: "Menjalankan kartu Parkir Bebas otomatis",
+    cardChoiceFineOrChance: "Membayar denda kartu otomatis",
+    cardChoiceMoveBack: "Memilih langkah mundur otomatis",
+    cardChooseBuild: "Melewati pembangunan kartu otomatis",
+    card: "Menutup kartu otomatis",
+    taxPopup: "Menutup informasi pajak otomatis"
+  };
+  return labels[actionType] || "Menjalankan aksi otomatis";
+}
+
+function getAfkActionDescriptor(stateLike = roomState) {
+  if (!stateLike || !roomRef || !["orderRoll", "playing"].includes(stateLike.status)) return null;
+  if (isGamePausedForDisconnect(stateLike) || stateLike.isRolling) return null;
+
+  if (stateLike.status === "orderRoll") {
+    const order = stateLike.orderRoll;
+    const queue = normalizeSeatArray(order?.queue);
+    const currentIndex = Number(order?.currentIndex || 0);
+    const seat = Number(queue[currentIndex] ?? stateLike.currentSeat);
+    if (!Number.isInteger(seat) || order?.completed) return null;
+    const kind = "startingOrder";
+    return {
+      kind,
+      seat,
+      label: "Roulette penentuan giliran otomatis",
+      durationMs: getAfkTimeoutForKind(kind),
+      availableAt: Date.now(),
+      signature: [
+        stateLike.status,
+        kind,
+        seat,
+        currentIndex,
+        Number(order?.round || 1),
+        normalizeSeatArray(order?.histories?.[seat]).length,
+        String(order?.activeRollId || "")
+      ].join("|")
+    };
+  }
+
+  const seat = Number(stateLike.currentSeat);
+  const player = stateLike.players?.[seat];
+  if (!Number.isInteger(seat) || !player || player.bankrupt || !player.inGame) return null;
+
+  const action = stateLike.pendingAction;
+  if (action && Number(action.seat) === seat) {
+    const kind = String(action.type || "");
+    const durationMs = getAfkTimeoutForKind(kind);
+    if (!durationMs) return null;
+    const revealAt = Number(action.revealAt || stateLike.cardPopup?.revealAt || 0);
+    return {
+      kind,
+      seat,
+      label: getAfkPendingActionLabel(kind),
+      durationMs,
+      availableAt: Math.max(Date.now(), revealAt || 0),
+      signature: [
+        stateLike.status,
+        kind,
+        seat,
+        String(action.cardId || action.popupId || action.propertyId || ""),
+        Number(action.revealAt || 0),
+        String(stateLike.cardPopup?.id || ""),
+        String(stateLike.lastMove?.id || ""),
+        String(stateLike.lastRoulette?.id || "")
+      ].join("|")
+    };
+  }
+
+  if (stateLike.debtState && Number(stateLike.debtState.seat) === seat) {
+    const kind = "debt";
+    return {
+      kind,
+      seat,
+      label: "Menjual properti otomatis",
+      durationMs: getAfkTimeoutForKind(kind),
+      availableAt: Date.now(),
+      signature: [
+        stateLike.status,
+        kind,
+        seat,
+        Number(stateLike.debtState.createdAt || 0),
+        Number(player.money || 0),
+        getOwnedPropertyIds(seat, stateLike).length
+      ].join("|")
+    };
+  }
+
+  if (player.inJail) {
+    const kind = "jail";
+    return {
+      kind,
+      seat,
+      label: "Roulette penjara otomatis",
+      durationMs: getAfkTimeoutForKind(kind),
+      availableAt: Date.now(),
+      signature: [stateLike.status, kind, seat, Number(player.jailAttempts || 0), String(stateLike.lastRoulette?.id || "")].join("|")
+    };
+  }
+
+  const kind = "roll";
+  return {
+    kind,
+    seat,
+    label: "Roulette otomatis",
+    durationMs: getAfkTimeoutForKind(kind),
+    availableAt: Date.now(),
+    signature: [
+      stateLike.status,
+      kind,
+      seat,
+      Number(player.position || 0),
+      Number(player.roulette12Streak || 0),
+      String(stateLike.lastRoulette?.id || "")
+    ].join("|")
+  };
+}
+
+function renderAfkActionTimer() {
+  const descriptor = afkActionDescriptor;
+  const visible = Boolean(descriptor && afkActionDeadlineAt > 0);
+  const remainingMs = visible ? Math.max(0, afkActionDeadlineAt - Date.now()) : 0;
+  const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  const actorName = descriptor ? (roomState?.players?.[descriptor.seat]?.name || "Pemain") : "";
+  const label = descriptor
+    ? (Number(descriptor.seat) === Number(mySeat) ? descriptor.label : `${actorName}: ${descriptor.label}`)
+    : "";
+  const urgent = visible && seconds <= 5;
+
+  if (els.turnTimer) {
+    els.turnTimer.classList.toggle("hidden", !visible);
+    els.turnTimer.classList.toggle("urgent", urgent);
+  }
+  if (els.turnTimerLabel) els.turnTimerLabel.textContent = label;
+  if (els.turnTimerValue) els.turnTimerValue.textContent = String(seconds);
+
+  const orderVisible = visible && descriptor?.kind === "startingOrder";
+  if (els.orderAfkTimer) {
+    els.orderAfkTimer.classList.toggle("hidden", !orderVisible);
+    els.orderAfkTimer.classList.toggle("urgent", orderVisible && urgent);
+  }
+  if (els.orderAfkTimerValue) els.orderAfkTimerValue.textContent = String(seconds);
+
+  const cardVisible = visible
+    && Boolean(roomState?.pendingAction)
+    && !localPopupOpen;
+  if (els.cardAfkTimer) {
+    els.cardAfkTimer.classList.toggle("hidden", !cardVisible);
+    els.cardAfkTimer.classList.toggle("urgent", cardVisible && urgent);
+  }
+  if (els.cardAfkTimerValue) els.cardAfkTimerValue.textContent = String(seconds);
+}
+
+function clearAfkActionTimer() {
+  if (afkActionTimeout) clearTimeout(afkActionTimeout);
+  if (afkCountdownInterval) clearInterval(afkCountdownInterval);
+  afkActionTimeout = null;
+  afkCountdownInterval = null;
+  afkActionSignature = "";
+  afkActionDeadlineAt = 0;
+  afkActionDescriptor = null;
+  afkAutoActionInProgress = false;
+  renderAfkActionTimer();
+}
+
+function armAfkActionTimeout(delayMs) {
+  if (afkActionTimeout) clearTimeout(afkActionTimeout);
+  afkActionDeadlineAt = Date.now() + Math.max(0, Number(delayMs || 0));
+  renderAfkActionTimer();
+  afkActionTimeout = setTimeout(() => {
+    afkActionTimeout = null;
+    handleAfkActionTimeout().catch(error => {
+      console.warn("Aksi otomatis AFK gagal dijalankan.", error);
+    });
+  }, Math.max(30, Number(delayMs || 0)));
+}
+
+function syncAfkActionTimer(stateLike = roomState, { force = false } = {}) {
+  const descriptor = getAfkActionDescriptor(stateLike);
+  if (!descriptor) {
+    clearAfkActionTimer();
+    return;
+  }
+
+  if (!force && afkActionSignature === descriptor.signature && afkActionDeadlineAt > 0) {
+    afkActionDescriptor = descriptor;
+    renderAfkActionTimer();
+    return;
+  }
+
+  if (afkActionTimeout) clearTimeout(afkActionTimeout);
+  if (afkCountdownInterval) clearInterval(afkCountdownInterval);
+  afkActionSignature = descriptor.signature;
+  afkActionDescriptor = descriptor;
+  const delay = Math.max(0, Number(descriptor.availableAt || Date.now()) - Date.now()) + descriptor.durationMs;
+  armAfkActionTimeout(delay);
+  afkCountdownInterval = setInterval(renderAfkActionTimer, 250);
+}
+
+function chooseAfkDebtPropertyId(stateLike, seat) {
+  const player = stateLike?.players?.[seat];
+  if (!player) return "";
+  const deficit = Math.max(0, Math.abs(Number(player.money || 0)));
+  const candidates = getOwnedPropertyIds(seat, stateLike)
+    .map(propertyId => ({ propertyId, value: getPropertyLiquidationValue(propertyId, stateLike) }))
+    .filter(item => item.value > 0);
+  if (!candidates.length) return "";
+
+  const covering = candidates
+    .filter(item => item.value >= deficit)
+    .sort((a, b) => a.value - b.value || a.propertyId.localeCompare(b.propertyId));
+  if (covering.length) return covering[0].propertyId;
+
+  candidates.sort((a, b) => b.value - a.value || a.propertyId.localeCompare(b.propertyId));
+  return candidates[0].propertyId;
+}
+
+async function waitForAfkStateUpdate(delayMs = 180) {
+  await new Promise(resolve => setTimeout(resolve, delayMs));
+  if (!roomRef) return null;
+  const latest = (await roomRef.once("value")).val();
+  if (latest) roomState = latest;
+  return latest;
+}
+
+async function executeAfkAutomaticAction(descriptor) {
+  if (!roomRef || !descriptor || Number(descriptor.seat) !== Number(mySeat)) return;
+
+  const latest = (await roomRef.once("value")).val();
+  if (!latest) return;
+  roomState = latest;
+  const currentDescriptor = getAfkActionDescriptor(latest);
+  if (!currentDescriptor || currentDescriptor.signature !== descriptor.signature) return;
+
+  switch (descriptor.kind) {
+    case "startingOrder":
+      await rollStartingOrder();
+      return;
+    case "roll":
+      if (latest.orderRoll?.completed && latest.orderRoll?.resultId) {
+        localDismissedOrderResultId = latest.orderRoll.resultId;
+        renderOrderOverlay();
+      }
+      await rollDice();
+      return;
+    case "jail":
+      await rollForJailRoulette();
+      return;
+    case "buy":
+    case "build":
+      await skipCurrentAction();
+      return;
+    case "freeParkingChoice": {
+      if (Number(latest.taxPool || 0) > 0) {
+        await collectFreeParkingTax();
+        return;
+      }
+      await beginFreeMoveSelection();
+      const afterSelection = await waitForAfkStateUpdate(220);
+      const eligible = normalizeTileIndices(afterSelection?.pendingAction?.eligibleIndices);
+      if (afterSelection?.pendingAction?.type === "freeMove" && eligible.length) {
+        const target = eligible[Math.floor(Math.random() * eligible.length)];
+        await chooseFreeMoveTarget(target);
+      }
+      return;
+    }
+    case "freeMove": {
+      const eligible = normalizeTileIndices(latest.pendingAction?.eligibleIndices);
+      if (eligible.length) {
+        const target = eligible[Math.floor(Math.random() * eligible.length)];
+        await chooseFreeMoveTarget(target);
+      }
+      return;
+    }
+    case "roulette12Bonus": {
+      await acceptRoulette12Bonus();
+      await waitForAfkStateUpdate(220);
+      if (canIRoll()) await rollDice();
+      return;
+    }
+    case "tripleTwelveJail":
+    case "goJailPopup":
+    case "cardMove":
+    case "cardFreeParking":
+    case "card":
+    case "taxPopup":
+      await closeCardAndFinishTurn();
+      return;
+    case "taxExemptionChoice":
+      if (Number(latest.players?.[mySeat]?.taxExemptionCards || 0) > 0) {
+        await useTaxExemptionCard();
+      } else {
+        await payPendingTax();
+      }
+      return;
+    case "cardChoiceFineOrChance":
+      await payCardFineInsteadOfChance();
+      return;
+    case "cardChoiceMoveBack": {
+      const choices = normalizeTileIndices(latest.pendingAction?.choices).filter(value => [2, 5].includes(value));
+      const selected = choices.length ? choices[Math.floor(Math.random() * choices.length)] : 2;
+      await chooseCardMoveBack(selected);
+      return;
+    }
+    case "cardChooseBuild":
+      await skipCardSpecialAction();
+      return;
+    case "debt": {
+      const propertyId = chooseAfkDebtPropertyId(latest, mySeat);
+      if (!propertyId) return;
+      renderActionPanel();
+      const select = document.getElementById("debtPropertySelect");
+      if (!select) return;
+      select.value = propertyId;
+      await sellSelectedPropertyForDebt();
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+async function handleAfkActionTimeout() {
+  const descriptor = afkActionDescriptor;
+  if (!descriptor || afkAutoActionInProgress) return;
+
+  const currentDescriptor = getAfkActionDescriptor(roomState);
+  if (!currentDescriptor || currentDescriptor.signature !== descriptor.signature) {
+    syncAfkActionTimer(roomState, { force: true });
+    return;
+  }
+
+  // Pointer/tombol yang ditekan tepat saat timer habis diberi kesempatan untuk
+  // menyelesaikan handler manual lebih dulu agar tidak terjadi dua keputusan.
+  if (Number(descriptor.seat) === Number(mySeat)
+    && Date.now() - lastLocalGameInteractionAt < AFK_MANUAL_INTERACTION_GRACE_MS) {
+    armAfkActionTimeout(AFK_RETRY_AFTER_INTERACTION_MS);
+    return;
+  }
+
+  if (Number(descriptor.seat) !== Number(mySeat)) {
+    renderAfkActionTimer();
+    return;
+  }
+
+  afkAutoActionInProgress = true;
+  try {
+    await executeAfkAutomaticAction(descriptor);
+  } finally {
+    afkAutoActionInProgress = false;
+    setTimeout(() => {
+      if (roomRef && roomState) syncAfkActionTimer(roomState, { force: true });
+    }, 350);
+  }
+}
+
+
 function renderUI() {
   const players = roomState.players || {};
   const current = players[roomState.currentSeat];
@@ -5611,6 +6056,7 @@ function closeVoicePeer(remoteSeat) {
 
   try {
     peer.pc.onicecandidate = null;
+    peer.pc.onicecandidateerror = null;
     peer.pc.ontrack = null;
     peer.pc.onnegotiationneeded = null;
     peer.pc.onconnectionstatechange = null;
@@ -5636,7 +6082,10 @@ function ensureVoicePeer(remoteSeat) {
   const remotePlayer = roomState?.players?.[normalizedSeat];
   if (!remotePlayer?.id || !isPlayerConnectedInState(roomState, remotePlayer)) return null;
 
-  const pc = new RTCPeerConnection({ iceServers: getVoiceIceServers() });
+  const pc = new RTCPeerConnection({
+    iceServers: getVoiceIceServers(),
+    iceCandidatePoolSize: 4
+  });
   const audio = document.createElement("audio");
   audio.autoplay = true;
   audio.playsInline = true;
@@ -5686,6 +6135,14 @@ function ensureVoicePeer(remoteSeat) {
 
     sendVoiceSignal(normalizedSeat, { candidate }).catch(error => {
       console.warn("ICE candidate voice gagal dikirim.", error);
+    });
+  };
+
+  pc.onicecandidateerror = event => {
+    console.warn(`ICE voice seat ${normalizedSeat} mengalami error.`, {
+      errorCode: event?.errorCode,
+      errorText: event?.errorText,
+      url: event?.url
     });
   };
 
@@ -5745,7 +6202,8 @@ async function processVoiceSignal(snapshot, retryCount = 0) {
   if (!message || !voiceNetworkStarted || mySeat === null) return;
 
   const createdAt = Number(message.createdAt || 0);
-  if (createdAt && Date.now() - createdAt > VOICE_SIGNAL_MAX_AGE_MS) {
+  const serverNow = getFirebaseServerNow();
+  if (createdAt && serverNow - createdAt > VOICE_SIGNAL_MAX_AGE_MS) {
     snapshot.ref.remove().catch(() => {});
     return;
   }
@@ -5765,17 +6223,22 @@ async function processVoiceSignal(snapshot, retryCount = 0) {
   }
 
   const remotePlayer = roomState?.players?.[remoteSeat];
-  if ((!remotePlayer?.id || remotePlayer.id !== message.fromPlayerId) && retryCount < 12) {
+  if ((!remotePlayer?.id || remotePlayer.id !== message.fromPlayerId) && retryCount < 30) {
     setTimeout(() => {
       processVoiceSignal(snapshot, retryCount + 1).catch(() => {});
-    }, 180);
+    }, 200);
     return;
   }
-  snapshot.ref.remove().catch(() => {});
-  if (!remotePlayer?.id || remotePlayer.id !== message.fromPlayerId) return;
+  if (!remotePlayer?.id || remotePlayer.id !== message.fromPlayerId) {
+    snapshot.ref.remove().catch(() => {});
+    return;
+  }
 
   const peer = ensureVoicePeer(remoteSeat);
-  if (!peer || peer.closed) return;
+  if (!peer || peer.closed) {
+    snapshot.ref.remove().catch(() => {});
+    return;
+  }
 
   try {
     if (message.description) {
@@ -5784,7 +6247,10 @@ async function processVoiceSignal(snapshot, retryCount = 0) {
         && (peer.pc.signalingState === "stable" || peer.isSettingRemoteAnswerPending);
       const offerCollision = description.type === "offer" && !readyForOffer;
       peer.ignoreOffer = !peer.polite && offerCollision;
-      if (peer.ignoreOffer) return;
+      if (peer.ignoreOffer) {
+        snapshot.ref.remove().catch(() => {});
+        return;
+      }
 
       if (offerCollision && peer.polite && peer.pc.signalingState !== "stable") {
         await peer.pc.setLocalDescription({ type: "rollback" }).catch(() => {});
@@ -5816,9 +6282,17 @@ async function processVoiceSignal(snapshot, retryCount = 0) {
         peer.pendingCandidates.push(message.candidate);
       }
     }
+    snapshot.ref.remove().catch(() => {});
   } catch (error) {
     if (!peer.ignoreOffer) {
       console.warn(`Signal voice dari seat ${remoteSeat} gagal diproses.`, error);
+    }
+    if (retryCount < 3 && voiceNetworkStarted) {
+      setTimeout(() => {
+        processVoiceSignal(snapshot, retryCount + 1).catch(() => {});
+      }, 250 * (retryCount + 1));
+    } else {
+      snapshot.ref.remove().catch(() => {});
     }
   }
 }
@@ -5890,6 +6364,20 @@ async function toggleLocalMicrophone() {
       const track = stream.getAudioTracks()[0] || null;
       if (!track) throw new Error("Track audio tidak tersedia.");
       await attachLocalMicrophoneToPeers(track);
+
+      if (voiceConnectivityCheckTimer) clearTimeout(voiceConnectivityCheckTimer);
+      voiceConnectivityCheckTimer = setTimeout(() => {
+        voiceConnectivityCheckTimer = null;
+        const remoteConnected = Object.values(roomState?.players || {})
+          .some(player => player?.id
+            && Number(player.seat) !== Number(mySeat)
+            && isPlayerConnectedInState(roomState, player));
+        const peerConnected = Array.from(voicePeers.values())
+          .some(peer => peer?.pc?.connectionState === "connected");
+        if (remoteConnected && !peerConnected) {
+          console.warn("Mic aktif, tetapi peer voice belum terhubung. Jaringan mungkin memerlukan TURN server.");
+        }
+      }, 8000);
     }
   } catch (error) {
     localVoiceMicEnabled = false;
@@ -5947,8 +6435,17 @@ function updateVoiceControlButton(row, player, playerConnected) {
   button.setAttribute("aria-label", speakerOff
     ? `Nyalakan suara ${player.name}`
     : `Matikan suara ${player.name}`);
+  const connectionState = voicePeers.get(seat)?.pc?.connectionState || "new";
+  const connectionLabel = {
+    new: "menyiapkan",
+    connecting: "menghubungkan",
+    connected: "terhubung",
+    disconnected: "terputus sementara",
+    failed: "gagal",
+    closed: "ditutup"
+  }[connectionState] || connectionState;
   button.title = playerConnected
-    ? (speakerOff ? `Speaker ${player.name} mati` : `Speaker ${player.name} aktif`)
+    ? `${speakerOff ? `Speaker ${player.name} mati` : `Speaker ${player.name} aktif`} • Voice ${connectionLabel}`
     : `${player.name} sedang offline`;
 }
 
@@ -5965,7 +6462,7 @@ function refreshVoiceControlButtons() {
 async function startVoiceChatNetwork() {
   if (voiceNetworkStarted || !roomRef || mySeat === null) return;
   voiceNetworkStarted = true;
-  voiceSignalStartedAt = Date.now();
+  voiceSignalStartedAt = getFirebaseServerNow();
 
   if (!isVoiceChatSupported()) {
     refreshVoiceControlButtons();
@@ -5983,6 +6480,8 @@ async function startVoiceChatNetwork() {
 }
 
 async function stopVoiceChatNetwork() {
+  if (voiceConnectivityCheckTimer) clearTimeout(voiceConnectivityCheckTimer);
+  voiceConnectivityCheckTimer = null;
   if (voiceSignalInboxRef && voiceSignalHandler) {
     voiceSignalInboxRef.off("child_added", voiceSignalHandler);
   }
@@ -7974,7 +8473,12 @@ async function leaveRoom() {
 
   const participantSeats = getActiveSeatsFromState(latest);
   const remainingParticipants = participantSeats.filter(seat => seat !== Number(mySeat));
-  const assetSettlement = latest?.status === "playing" && isPlayerGameParticipant(leavingPlayer, latest)
+  const gameEndsAfterLeave = latest?.status === "playing"
+    && isPlayerGameParticipant(leavingPlayer, latest)
+    && remainingParticipants.length <= 1;
+  const assetSettlement = latest?.status === "playing"
+    && isPlayerGameParticipant(leavingPlayer, latest)
+    && !gameEndsAfterLeave
     ? appendLeavingAssetSettlementUpdates(latest, mySeat, updates)
     : null;
   const assetSettlementText = describeLeavingAssetSettlement(assetSettlement);
@@ -8079,7 +8583,9 @@ async function leaveRoom() {
         deckType: "system",
         deck: "Game Selesai",
         title: winnerSeat !== null ? `${winnerName} Menang!` : "Game Selesai",
-        text: `${leavingPlayer?.name || "Seorang pemain"} keluar dari permainan.${assetSettlementText ? ` ${assetSettlementText}` : ""}`,
+        text: winnerSeat !== null
+          ? "Semua pemain lain sudah bangkrut atau keluar. Game dinyatakan selesai."
+          : "Tidak ada pemain aktif yang tersisa.",
         seat: winnerSeat,
         playerName: winnerName
       };
@@ -8164,6 +8670,7 @@ async function leaveRoom() {
     : listingAfterLeave;
 
   await stopVoiceChatNetwork();
+  clearAfkActionTimer();
 
   if (roomWillBeEmpty) {
     // Tidak ada anggota lain yang masih terhubung. Hapus semua node room saat
@@ -8361,6 +8868,14 @@ window.addEventListener("keydown", (event) => {
 });
 els.cardCloseBtn.addEventListener("click", closeCardAndFinishTurn);
 els.cardContinueBtn.addEventListener("click", closeCardAndFinishTurn);
+
+// Interaksi manual tepat sebelum timer habis diberi prioritas atas aksi AFK.
+const noteLocalGameInteraction = event => {
+  if (!els.gamePanel || !event?.target || !els.gamePanel.contains(event.target)) return;
+  lastLocalGameInteractionAt = Date.now();
+};
+document.addEventListener("pointerdown", noteLocalGameInteraction, true);
+document.addEventListener("keydown", noteLocalGameInteraction, true);
 
 // Browser HP mengizinkan audio setelah interaksi pengguna pertama.
 document.addEventListener("pointerdown", unlockMoneyAudio, { passive: true });

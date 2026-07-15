@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Monopoly Board Game</title>
-  <link rel="stylesheet" href="./style.css?v=lobby-browser-v1" />
+  <link rel="stylesheet" href="./style.css?v=voice-afk-winner-v1" />
 </head>
 <body>
   <main id="appRoot" class="app">
@@ -158,6 +158,11 @@
             <div class="label">Giliran Saat Ini</div>
             <strong id="turnName">-</strong>
           </div>
+          <div id="turnTimer" class="turn-timer hidden" aria-live="polite">
+            <span id="turnTimerLabel">Aksi otomatis</span>
+            <strong id="turnTimerValue">30</strong>
+            <span>detik</span>
+          </div>
 
           <div class="roulette-box">
             <div class="roulette-pointer"></div>
@@ -225,6 +230,7 @@
         <p id="orderText">Setiap pemain memutar roulette untuk menentukan urutan.</p>
         <div id="orderResults" class="order-results"></div>
         <button id="orderRollBtn" class="primary order-roll-btn" type="button">Putar Roulette Penentuan</button>
+        <div id="orderAfkTimer" class="order-afk-timer hidden">Roulette otomatis dalam <strong id="orderAfkTimerValue">25</strong> detik</div>
         <div class="order-note">Nilai terbesar mendapat giliran lebih awal. Jika seri, pemain terkait akan melakukan roulette ulang.</div>
       </div>
     </section>
@@ -249,6 +255,7 @@
         <h2 id="cardTitle">Judul Kartu</h2>
         <div id="cardText" class="card-text">Isi kartu.</div>
         <div id="cardActions" class="card-popup-actions hidden"></div>
+        <div id="cardAfkTimer" class="card-afk-timer hidden">Aksi otomatis dalam <strong id="cardAfkTimerValue">10</strong> detik</div>
         <button id="cardContinueBtn" class="primary full" type="button">Tutup & Lanjutkan</button>
       </div>
     </section>
@@ -262,6 +269,6 @@
   <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
 
   <script src="./firebase-config.js"></script>
-  <script src="./game.js?v=client-assisted-cleanup-v1"></script>
+  <script src="./game.js?v=voice-afk-winner-v1"></script>
 </body>
 </html>
