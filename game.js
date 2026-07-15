@@ -7286,22 +7286,13 @@ class BoardScene extends Phaser.Scene {
     title.setOrigin(.5);
     title.setAngle(0);
 
-
-    const sub = this.add.text(startX + tile * 5.5, startY + tile * 6.1, "ONLINE MVP", {
-      fontFamily: "Arial",
-      fontSize: `${Math.floor(tile * .22)}px`,
-      fontStyle: "bold",
-      color: "#14213d"
-    });
-    sub.setOrigin(.5);
-
     const taxShadow = this.add.rectangle(startX + tile * 5.5, startY + tile * 7.55, tile * 2.55, tile * .86, 0x000000, 0.10);
     taxShadow.setStrokeStyle(0, 0x000000);
     const taxBox = this.add.rectangle(startX + tile * 5.5, startY + tile * 7.48, tile * 2.55, tile * .86, 0xf1d38c);
     taxBox.setStrokeStyle(3, 0x14213d);
     const taxInner = this.add.rectangle(startX + tile * 5.72, startY + tile * 7.48, tile * 1.6, tile * .44, 0x2d4038);
     taxInner.setStrokeStyle(2, 0x7fb98b);
-    this.add.text(startX + tile * 5.5, startY + tile * 7.02, "UANG PAJAK", {
+    this.add.text(startX + tile * 5.5, startY + tile * 6.9, "UANG PAJAK", {
       fontFamily: "Arial",
       fontSize: `${Math.floor(tile * .15)}px`,
       fontStyle: "bold",
